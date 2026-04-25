@@ -166,7 +166,7 @@ func TestScanPodsDetectsRestartDelta(t *testing.T) {
 }
 
 func TestIncidentOpensOnAlertOnly(t *testing.T) {
-	w := &watcher{recoveryTicks: 3}
+	w := &watcher{recoveryTicks: 3, minConfirmations: 1}
 	now := time.Now().UTC()
 
 	// WARN should not open an incident.
@@ -194,7 +194,7 @@ func TestIncidentOpensOnAlertOnly(t *testing.T) {
 
 func TestIncidentClosesAfterRecoveryTicks(t *testing.T) {
 	dir := t.TempDir()
-	w := &watcher{recoveryTicks: 3, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	w := &watcher{recoveryTicks: 3, minConfirmations: 1, logDir: dir, cfgContext: "test", apiHost: "https://example"}
 	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 
 	w.recordIncident(t0, "ALERT", "readyz FAIL etcd-readiness failed", 5000,
@@ -257,7 +257,7 @@ func TestIncidentClosesAfterRecoveryTicks(t *testing.T) {
 
 func TestIncidentNonOKResetsRecoveryStreak(t *testing.T) {
 	dir := t.TempDir()
-	w := &watcher{recoveryTicks: 3, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	w := &watcher{recoveryTicks: 3, minConfirmations: 1, logDir: dir, cfgContext: "test", apiHost: "https://example"}
 	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 
 	w.recordIncident(t0, "ALERT", "readyz FAIL", 5000, nil, nil, nil)
@@ -288,7 +288,7 @@ func TestIncidentNonOKResetsRecoveryStreak(t *testing.T) {
 
 func TestForceCloseOnShutdown(t *testing.T) {
 	dir := t.TempDir()
-	w := &watcher{recoveryTicks: 3, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	w := &watcher{recoveryTicks: 3, minConfirmations: 1, logDir: dir, cfgContext: "test", apiHost: "https://example"}
 	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 
 	w.recordIncident(t0, "ALERT", "readyz FAIL", 5000, nil, nil, nil)
@@ -302,6 +302,108 @@ func TestForceCloseOnShutdown(t *testing.T) {
 	body, _ := os.ReadFile(files[0])
 	if !strings.Contains(string(body), "Closed reason:** shutdown") {
 		t.Errorf("expected shutdown close reason in report:\n%s", string(body))
+	}
+}
+
+func TestDebounceSingleAlertDoesNotOpen(t *testing.T) {
+	dir := t.TempDir()
+	w := &watcher{recoveryTicks: 3, minConfirmations: 2, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	w.recordIncident(t0, "ALERT", "blip", 5000, nil, nil, nil)
+	if w.cur != nil {
+		t.Fatal("single ALERT should not open an incident with min-confirmations=2")
+	}
+	if got := len(w.pending); got != 1 {
+		t.Errorf("expected 1 pending tick, got %d", got)
+	}
+
+	// OK arrives — drops the pending blip.
+	w.recordIncident(t0.Add(10*time.Second), "OK", "", 90, nil, nil, nil)
+	if w.cur != nil {
+		t.Fatal("OK after isolated ALERT should not have opened anything")
+	}
+	if got := len(w.pending); got != 0 {
+		t.Errorf("expected pending cleared on OK, got %d", got)
+	}
+
+	// No file written.
+	files, _ := filepath.Glob(filepath.Join(dir, "incident-*.md"))
+	if len(files) != 0 {
+		t.Errorf("expected 0 reports, got %v", files)
+	}
+}
+
+func TestDebounceTwoConsecutiveAlertsOpen(t *testing.T) {
+	dir := t.TempDir()
+	w := &watcher{recoveryTicks: 3, minConfirmations: 2, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	w.recordIncident(t0, "ALERT", "readyz FAIL", 5000, nil, nil, nil)
+	w.recordIncident(t0.Add(10*time.Second), "ALERT", "readyz FAIL again", 6000, nil, nil, nil)
+
+	if w.cur == nil {
+		t.Fatal("2 consecutive ALERTs should open an incident with min-confirmations=2")
+	}
+	// Both pending ticks should have been folded into the incident timeline.
+	if got := len(w.cur.ticks); got != 2 {
+		t.Errorf("expected 2 ticks in incident timeline, got %d", got)
+	}
+	// Incident start time is the first ALERT, not the confirmation tick.
+	if !w.cur.startedAt.Equal(t0) {
+		t.Errorf("expected startedAt=%v, got %v", t0, w.cur.startedAt)
+	}
+}
+
+func TestDebounceWarnPreambleIncludedInIncident(t *testing.T) {
+	dir := t.TempDir()
+	w := &watcher{recoveryTicks: 3, minConfirmations: 2, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	w.recordIncident(t0, "WARN", "API slow 1500ms", 1500, nil, nil, nil)
+	if w.cur != nil {
+		t.Fatal("WARN alone should not open an incident")
+	}
+	w.recordIncident(t0.Add(10*time.Second), "ALERT", "readyz FAIL", 5000, nil, nil, nil)
+	if w.cur == nil {
+		t.Fatal("WARN+ALERT should reach min-confirmations=2 and open an incident")
+	}
+	if got := len(w.cur.ticks); got != 2 {
+		t.Errorf("expected 2 ticks (WARN preamble + ALERT), got %d", got)
+	}
+	// Start time is the WARN — that's when trouble began.
+	if !w.cur.startedAt.Equal(t0) {
+		t.Errorf("expected startedAt=WARN time %v, got %v", t0, w.cur.startedAt)
+	}
+}
+
+func TestDebounceWarnOnlySequenceNeverOpens(t *testing.T) {
+	dir := t.TempDir()
+	w := &watcher{recoveryTicks: 3, minConfirmations: 2, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 10; i++ {
+		w.recordIncident(t0.Add(time.Duration(i)*10*time.Second), "WARN", "API slow", 1500, nil, nil, nil)
+	}
+	if w.cur != nil {
+		t.Fatal("WARN-only sequence should never open an incident")
+	}
+	// Buffer should be capped, not 10.
+	if got := len(w.pending); got > 2*w.minConfirmations*4 {
+		t.Errorf("pending grew unbounded: %d", got)
+	}
+}
+
+func TestDebounceAlertResetsOnOK(t *testing.T) {
+	dir := t.TempDir()
+	w := &watcher{recoveryTicks: 3, minConfirmations: 2, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	w.recordIncident(t0, "ALERT", "blip 1", 5000, nil, nil, nil)
+	w.recordIncident(t0.Add(10*time.Second), "OK", "", 90, nil, nil, nil)
+	w.recordIncident(t0.Add(20*time.Second), "ALERT", "blip 2", 5000, nil, nil, nil)
+	if w.cur != nil {
+		t.Fatal("two isolated ALERTs separated by OK should NOT open an incident")
 	}
 }
 

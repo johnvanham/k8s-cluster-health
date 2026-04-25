@@ -41,6 +41,7 @@ Requires Go 1.25+. The binary is ~50 MB (statically links `client-go`).
 | `-no-notify` | off | Suppress GNOME desktop notifications |
 | `-log-dir` | `.` | Directory to write incident reports |
 | `-recovery-ticks` | `3` | Consecutive OK ticks required to close an incident |
+| `-min-confirmations` | `2` | Consecutive non-OK ticks (with at least one ALERT) required to open an incident |
 
 ## How it works
 
@@ -64,12 +65,27 @@ On `ALERT` ticks (and `WARN` for slow-API), it pushes a `notify-send` desktop no
 
 ### Incident reports
 
-When an `ALERT` tick fires, the watcher opens an **incident** and starts collecting every subsequent tick (ALERT, WARN, and OK) until it sees `-recovery-ticks` (default 3) consecutive OK ticks. On close, it writes a markdown report to `-log-dir` (default current directory) named `incident-<UTC-start>.md`.
+The watcher debounces non-OK ticks before escalating, so a single transient blip (a slow `/readyz` probe, a one-off pod restart, a brief liveness probe failure) doesn't fire a notification. An incident opens only when the buffered non-OK ticks reach `-min-confirmations` (default 2) **and** at least one of them is an ALERT. WARN-only stretches don't open incidents — sustained slow API is still visible on the tick line, but doesn't escalate without a hard failure.
 
-- **Start time** = timestamp of the first ALERT tick.
-- **End time** = timestamp of the *first* OK tick after the last non-OK tick (so the duration reflects how long the cluster was actually unhealthy, not how long the recovery probe ran).
+- **Start time** = timestamp of the *first* tick in the buffer that led to escalation (the WARN preamble is included if it preceded the confirming ALERT — providers see the lead-in).
+- **End time** = timestamp of the *first* OK tick after the last non-OK tick (so duration reflects how long the cluster was actually unhealthy, not how long the recovery probe ran).
+- **Recovery** closes the incident after `-recovery-ticks` (default 3) consecutive OK ticks.
 - **Closed reason** = `recovered` for normal close, `shutdown` if the program is killed mid-incident (a partial report is still written so SIGINT doesn't lose data).
 - A new ALERT or WARN during the recovery streak resets the OK counter — the incident stays open.
+
+Examples (`-min-confirmations 2`):
+
+| Tick sequence | Result |
+|---|---|
+| `ALERT, OK` | Single blip suppressed; nothing recorded. |
+| `ALERT, ALERT` | Incident opens at the second ALERT, includes both ticks in the timeline. |
+| `WARN, ALERT` | Incident opens; WARN is included as preamble. |
+| `WARN, WARN, WARN, …` | Never opens an incident (no ALERT in buffer). |
+| `ALERT, OK, ALERT` | Two isolated blips; OK clears the buffer; nothing opens. |
+
+Notification + terminal bell fire **once** at incident open and **once** at incident close — no per-tick spam during a long incident.
+
+Set `-min-confirmations 1` to restore "fire on first ALERT" behaviour.
 
 The report has three sections, ordered for ticket-pasting:
 
@@ -148,6 +164,11 @@ The test suite covers the pure / parsing functions:
 - `TestIncidentClosesAfterRecoveryTicks` — incident closes after `recoveryTicks` consecutive OKs, end time is the *first* OK after the last non-OK, duration reflects the unhealthy window, and the report contains the expected aggregates.
 - `TestIncidentNonOKResetsRecoveryStreak` — a new ALERT/WARN mid-recovery resets the OK counter; the incident stays open until 3 OKs occur back-to-back.
 - `TestForceCloseOnShutdown` — `forceCloseIncident` writes a report with `Closed reason: shutdown` so SIGINT mid-incident still produces a usable artefact.
+- `TestDebounceSingleAlertDoesNotOpen` — with `min-confirmations=2`, a single ALERT followed by OK does not open an incident or write a report.
+- `TestDebounceTwoConsecutiveAlertsOpen` — two consecutive ALERTs cross the threshold and both ticks land in the incident timeline; start time is the first ALERT, not the confirmation.
+- `TestDebounceWarnPreambleIncludedInIncident` — a WARN immediately followed by an ALERT crosses the threshold and the WARN is folded in as preamble (start time is the WARN).
+- `TestDebounceWarnOnlySequenceNeverOpens` — a long WARN-only sequence never opens an incident, and the pending buffer stays bounded.
+- `TestDebounceAlertResetsOnOK` — two isolated ALERTs separated by an OK are each treated as transient blips; nothing escalates.
 
 The Kubernetes API client itself is not mocked; the live-cluster paths (`scanPods`, `scanNodes`, `scanEvents`, `probeReadyz`) are exercised via the smoke run described below.
 

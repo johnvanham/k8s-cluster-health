@@ -102,14 +102,16 @@ type watcher struct {
 	apiHost    string
 	cfgContext string
 
-	interval      time.Duration
-	slowMs        int64
-	alertMs       int64
-	silent        bool
-	notify        bool
-	logDir        string
-	recoveryTicks int
-	cur           *incident
+	interval         time.Duration
+	slowMs           int64
+	alertMs          int64
+	silent           bool
+	notify           bool
+	logDir           string
+	recoveryTicks    int
+	minConfirmations int
+	cur              *incident
+	pending          []incidentTick
 
 	pods        map[podKey]podSnap
 	initialized bool
@@ -122,15 +124,16 @@ type watcher struct {
 
 func main() {
 	var (
-		kubeconfig    string
-		kubectx       string
-		interval      time.Duration
-		slowMs        int64
-		alertMs       int64
-		silent        bool
-		noNotify      bool
-		logDir        string
-		recoveryTicks int
+		kubeconfig       string
+		kubectx          string
+		interval         time.Duration
+		slowMs           int64
+		alertMs          int64
+		silent           bool
+		noNotify         bool
+		logDir           string
+		recoveryTicks    int
+		minConfirmations int
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (default: $KUBECONFIG or ~/.kube/config).")
@@ -142,10 +145,14 @@ func main() {
 	flag.BoolVar(&noNotify, "no-notify", false, "Do not send desktop notifications via notify-send.")
 	flag.StringVar(&logDir, "log-dir", ".", "Directory to write incident reports.")
 	flag.IntVar(&recoveryTicks, "recovery-ticks", 3, "Consecutive OK ticks required to close an incident.")
+	flag.IntVar(&minConfirmations, "min-confirmations", 2, "Consecutive non-OK ticks (with at least one ALERT) required to open an incident.")
 	flag.Parse()
 
 	if recoveryTicks < 1 {
 		recoveryTicks = 1
+	}
+	if minConfirmations < 1 {
+		minConfirmations = 1
 	}
 
 	cfg, ctxName, err := buildConfig(kubeconfig, kubectx)
@@ -169,21 +176,22 @@ func main() {
 	notifyOK := !noNotify && notifyAvailable()
 
 	w := &watcher{
-		cs:            cs,
-		httpClient:    hc,
-		apiHost:       strings.TrimRight(cfg.Host, "/"),
-		cfgContext:    ctxName,
-		interval:      interval,
-		slowMs:        slowMs,
-		alertMs:       alertMs,
-		silent:        silent,
-		notify:        notifyOK,
-		logDir:        logDir,
-		recoveryTicks: recoveryTicks,
-		pods:          make(map[podKey]podSnap),
-		seenEvents:    make(map[string]time.Time),
-		prevNotRdy:    make(map[string]bool),
-		startedAt:     time.Now().UTC(),
+		cs:               cs,
+		httpClient:       hc,
+		apiHost:          strings.TrimRight(cfg.Host, "/"),
+		cfgContext:       ctxName,
+		interval:         interval,
+		slowMs:           slowMs,
+		alertMs:          alertMs,
+		silent:           silent,
+		notify:           notifyOK,
+		logDir:           logDir,
+		recoveryTicks:    recoveryTicks,
+		minConfirmations: minConfirmations,
+		pods:             make(map[podKey]podSnap),
+		seenEvents:       make(map[string]time.Time),
+		prevNotRdy:       make(map[string]bool),
+		startedAt:        time.Now().UTC(),
 	}
 
 	notifyState := "off"
@@ -195,11 +203,11 @@ func main() {
 	default:
 		notifyState = "unavailable"
 	}
-	fmt.Printf("%s context=%s server=%s interval=%s slow=%dms alert=%dms notify=%s\n",
+	fmt.Printf("%s context=%s server=%s interval=%s slow=%dms alert=%dms confirm=%d recover=%d notify=%s\n",
 		paint(ansiBold, "k8s-cluster-health"),
 		paint(ansiCyan, ctxName),
 		paint(ansiDim, w.apiHost),
-		interval, slowMs, alertMs, notifyState)
+		interval, slowMs, alertMs, minConfirmations, recoveryTicks, notifyState)
 	fmt.Println(strings.Repeat("─", 80))
 
 	w.run(rootCtx)
@@ -320,21 +328,6 @@ func (w *watcher) tick(ctx context.Context) {
 			truncate(oneLine(e.msg), 160))
 	}
 
-	if hasAlert && !w.silent && useColor {
-		fmt.Print(bell)
-	}
-
-	if (hasAlert || hasWarn) && w.notify {
-		urgency := "critical"
-		title := fmt.Sprintf("k8s-cluster-health [%s] ALERT", w.cfgContext)
-		if hasWarn {
-			urgency = "normal"
-			title = fmt.Sprintf("k8s-cluster-health [%s] WARN", w.cfgContext)
-		}
-		body := buildNotifyBody(stripANSI(apiAlert), notReady, deltas, evts)
-		go sendNotification(title, body, urgency)
-	}
-
 	severity := "OK"
 	switch {
 	case hasAlert:
@@ -346,26 +339,31 @@ func (w *watcher) tick(ctx context.Context) {
 		rz.latency.Milliseconds(), notReady, deltas, evts)
 }
 
-// recordIncident drives the incident state machine. Opens an incident on the
-// first ALERT tick, appends every subsequent tick (WARN and OK included) to
-// the active incident's timeline, and closes when recoveryTicks consecutive
-// OK ticks have been seen. The closing tick's "end time" is the timestamp of
-// the first OK after the last non-OK tick, so duration reflects how long the
-// cluster was actually unhealthy rather than how long the recovery probe ran.
+// recordIncident drives the incident state machine.
+//
+// Debounce: non-OK ticks accumulate in w.pending. An incident opens only when
+// pending has at least minConfirmations entries AND at least one of them is
+// ALERT. WARN-only sequences never open an incident (a sustained slow API is
+// visible on screen but won't escalate without a hard failure). An OK tick
+// while no incident is open clears pending — a single isolated blip evaporates.
+//
+// Once open, every subsequent tick (ALERT/WARN/OK) appends to the incident's
+// timeline. The incident closes after recoveryTicks consecutive OK ticks; the
+// "ended" timestamp is the first OK after the last non-OK so duration reflects
+// the unhealthy window, not the recovery probe.
+//
+// Notification + terminal bell fire once at incident open and once at close
+// (no per-tick spam during an open incident).
 func (w *watcher) recordIncident(now time.Time, severity, apiAlert string,
 	latencyMs int64, notReady []string, deltas []restartDelta, evts []evtRow) {
 
-	isOK := severity == "OK"
-	if w.cur == nil {
-		if severity != "ALERT" {
-			return
-		}
-		w.cur = &incident{startedAt: now}
-		fmt.Printf("       %s %s opened incident at %s\n",
-			arrow(), paint(ansiYellow, "↻"), now.Format("15:04:05Z"))
+	mc := w.minConfirmations
+	if mc < 1 {
+		mc = 1
 	}
 
-	w.cur.ticks = append(w.cur.ticks, incidentTick{
+	isOK := severity == "OK"
+	t := incidentTick{
 		when:         now,
 		severity:     severity,
 		apiLatencyMs: latencyMs,
@@ -373,22 +371,81 @@ func (w *watcher) recordIncident(now time.Time, severity, apiAlert string,
 		notReady:     append([]string(nil), notReady...),
 		deltas:       append([]restartDelta(nil), deltas...),
 		evts:         append([]evtRow(nil), evts...),
-	})
+	}
 
-	if isOK {
-		w.cur.okStreak++
-		if w.cur.firstOKAt.IsZero() {
-			w.cur.firstOKAt = now
+	if w.cur != nil {
+		// Incident already open; append every tick.
+		w.cur.ticks = append(w.cur.ticks, t)
+		if isOK {
+			w.cur.okStreak++
+			if w.cur.firstOKAt.IsZero() {
+				w.cur.firstOKAt = now
+			}
+			if w.cur.okStreak >= w.recoveryTicks {
+				w.cur.endedAt = w.cur.firstOKAt
+				w.closeIncident("recovered")
+			}
+			return
 		}
-		if w.cur.okStreak >= w.recoveryTicks {
-			w.cur.endedAt = w.cur.firstOKAt
-			w.closeIncident("recovered")
+		w.cur.lastNonOKAt = now
+		w.cur.firstOKAt = time.Time{}
+		w.cur.okStreak = 0
+		return
+	}
+
+	// No incident yet.
+	if isOK {
+		// Single isolated blip resolved before confirmation; drop the buffer.
+		w.pending = nil
+		return
+	}
+
+	w.pending = append(w.pending, t)
+
+	alerts := 0
+	for _, p := range w.pending {
+		if p.severity == "ALERT" {
+			alerts++
+		}
+	}
+	if alerts == 0 || len(w.pending) < mc {
+		// Bound the buffer in case of a long WARN-only stretch that never
+		// escalates — keep enough to capture a future ALERT preamble.
+		cap := mc * 4
+		if cap < 8 {
+			cap = 8
+		}
+		if len(w.pending) > cap {
+			w.pending = w.pending[len(w.pending)-cap:]
 		}
 		return
 	}
-	w.cur.lastNonOKAt = now
-	w.cur.firstOKAt = time.Time{}
-	w.cur.okStreak = 0
+
+	// Threshold crossed and we have at least one ALERT in the buffer: escalate.
+	w.cur = &incident{
+		startedAt:   w.pending[0].when,
+		ticks:       append([]incidentTick(nil), w.pending...),
+		lastNonOKAt: w.pending[len(w.pending)-1].when,
+	}
+	pendingCount := len(w.pending)
+	last := w.pending[len(w.pending)-1]
+	w.pending = nil
+
+	fmt.Printf("       %s %s opened incident at %s (%d confirmation(s))\n",
+		arrow(), paint(ansiYellow, "↻"),
+		w.cur.startedAt.Format("15:04:05Z"), pendingCount)
+
+	if !w.silent && useColor {
+		fmt.Print(bell)
+	}
+	if w.notify {
+		title := fmt.Sprintf("k8s-cluster-health [%s] ALERT", w.cfgContext)
+		body := buildNotifyBody(last.apiAlert, last.notReady, last.deltas, last.evts)
+		if pendingCount > 1 {
+			body = fmt.Sprintf("Confirmed after %d non-OK tick(s).\n%s", pendingCount, body)
+		}
+		go sendNotification(title, body, "critical")
+	}
 }
 
 // closeIncident finalises the active incident, writes the markdown report,

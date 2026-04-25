@@ -44,7 +44,9 @@ Tests exercise pure functions only. The Kubernetes API client is not mocked; liv
 
 ## Incident state machine
 
-When an ALERT tick fires, the watcher opens an in-memory `incident` and appends every subsequent tick (ALERT/WARN/OK) until `recoveryTicks` consecutive OK ticks close it. The closing time is the *first* OK after the last non-OK tick, not the third — duration measures how long the cluster was unhealthy. A new non-OK during the recovery streak resets the counter. On program shutdown (`run()` defers `forceCloseIncident`), any open incident is written with `Closed reason: shutdown` so signal-killed sessions don't lose data.
+Non-OK ticks accumulate in `w.pending`. An incident opens only when `len(pending) >= minConfirmations` AND at least one pending tick is `ALERT`. WARN-only sequences never escalate. An OK tick while no incident is open clears the pending buffer (single blip → no incident). Once open, every subsequent tick (ALERT/WARN/OK) appends to the incident timeline; the incident closes after `recoveryTicks` consecutive OK ticks. The closing time is the *first* OK after the last non-OK tick, not the last — duration measures how long the cluster was unhealthy. A new non-OK during the recovery streak resets the counter. On program shutdown (`run()` defers `forceCloseIncident`), any open incident is written with `Closed reason: shutdown` so signal-killed sessions don't lose data.
+
+Notification + terminal bell fire only at the moment of escalation (incident open) and again at incident close. There is intentionally no per-tick notification while an incident is open — that's spam, especially when running multiple instances side-by-side.
 
 The report file is markdown with three sections — header, summary, timeline — in that order, for paste-ready use in provider support tickets. Don't reorder these sections; ticketing systems and humans both scan the header first. Keep the file extension `.md` (Linode/AWS/GitHub all render markdown in tickets).
 
