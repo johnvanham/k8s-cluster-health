@@ -451,6 +451,137 @@ func TestLocalNetUpDefaultsToTrueWithNoTargets(t *testing.T) {
 	}
 }
 
+func TestTruncateVisibleNoTruncationNeeded(t *testing.T) {
+	if got := truncateVisible("hello", 10); got != "hello" {
+		t.Errorf("got %q want %q", got, "hello")
+	}
+}
+
+func TestTruncateVisibleStripsAnsiFromCount(t *testing.T) {
+	// 5 visible chars wrapped in colour codes, max=10 → unchanged.
+	in := "\x1b[31mhello\x1b[0m"
+	if got := truncateVisible(in, 10); got != in {
+		t.Errorf("got %q want %q (visible len within budget)", got, in)
+	}
+}
+
+func TestTruncateVisibleTruncates(t *testing.T) {
+	in := "0123456789ABCDEF"
+	got := truncateVisible(in, 6)
+	visible := stripANSI(got)
+	// Expect 5 chars + ellipsis (… is one rune visually).
+	if visible != "01234…" {
+		t.Errorf("got visible %q, want %q", visible, "01234…")
+	}
+}
+
+func TestTruncateVisiblePreservesAnsiButTruncatesText(t *testing.T) {
+	in := "\x1b[31mAAAAAAAAAA\x1b[0mBBBBBBBBBB"
+	got := truncateVisible(in, 5)
+	// Visible should be 4 'A' + ellipsis.
+	visible := stripANSI(got)
+	if visible != "AAAA…" {
+		t.Errorf("got visible %q, want %q", visible, "AAAA…")
+	}
+	// And the original colour code should still appear in the output.
+	if !strings.Contains(got, "\x1b[31m") {
+		t.Errorf("expected ANSI codes preserved in %q", got)
+	}
+}
+
+func TestFormatFooterShowsSeverity(t *testing.T) {
+	saved := useColor
+	defer func() { useColor = saved }()
+	useColor = false
+
+	w := &watcher{cfgContext: "my-cluster", startedAt: time.Now().Add(-1 * time.Minute)}
+	w.updateFooterTick("OK", 92, "pods=75/75", "ready", "online")
+	got := w.formatFooter()
+
+	for _, want := range []string{
+		"ctx=my-cluster",
+		"status=OK",
+		"api=92ms",
+		"pods=75/75",
+		"nodes=ready",
+		"incidents=0",
+		"uptime=",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatFooter missing %q\nfull: %s", want, got)
+		}
+	}
+}
+
+func TestFormatFooterShowsActiveIncident(t *testing.T) {
+	saved := useColor
+	defer func() { useColor = saved }()
+	useColor = false
+
+	w := &watcher{cfgContext: "my-cluster", startedAt: time.Now().Add(-5 * time.Minute)}
+	w.cur = &incident{startedAt: time.Now().Add(-30 * time.Second), ticks: make([]incidentTick, 4)}
+	w.updateFooterTick("ALERT", 5000, "pods=73/75", "ready", "online")
+
+	got := w.formatFooter()
+	if !strings.Contains(got, "INCIDENT") {
+		t.Errorf("expected INCIDENT marker for active incident, got: %s", got)
+	}
+	if !strings.Contains(got, "(4 ticks)") {
+		t.Errorf("expected tick count in footer, got: %s", got)
+	}
+}
+
+func TestFormatFooterShowsLastIncident(t *testing.T) {
+	saved := useColor
+	defer func() { useColor = saved }()
+	useColor = false
+
+	endedAt := time.Date(2026, 4, 25, 14, 30, 0, 0, time.UTC)
+	w := &watcher{
+		cfgContext: "my-cluster",
+		startedAt:  time.Now().Add(-1 * time.Hour),
+		footer: footerState{
+			incidentCount:   3,
+			lastIncidentEnd: endedAt,
+			lastIncidentDur: 7 * time.Minute,
+			lastIncidentRsn: "recovered",
+		},
+	}
+	w.updateFooterTick("OK", 92, "pods=75/75", "ready", "online")
+
+	got := w.formatFooter()
+	for _, want := range []string{
+		"last=14:30Z",
+		"recovered",
+		"7m0s",
+		"incidents=3",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatFooter missing %q\nfull: %s", want, got)
+		}
+	}
+}
+
+func TestFormatFooterOfflineHidesPodApi(t *testing.T) {
+	saved := useColor
+	defer func() { useColor = saved }()
+	useColor = false
+
+	w := &watcher{cfgContext: "my-cluster", startedAt: time.Now()}
+	w.updateFooterTick("OFFLINE", 0, "", "", "offline")
+
+	got := w.formatFooter()
+	if !strings.Contains(got, "status=OFFLINE") {
+		t.Errorf("expected OFFLINE status, got: %s", got)
+	}
+	// pods/nodes/api shouldn't be reported when offline.
+	for _, unwanted := range []string{"api=", "pods=", "nodes="} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("offline footer should hide %q, got: %s", unwanted, got)
+		}
+	}
+}
+
 func TestPaintNoColorPassthrough(t *testing.T) {
 	saved := useColor
 	defer func() { useColor = saved }()

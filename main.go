@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"golang.org/x/term"
 )
 
 const (
@@ -88,6 +90,24 @@ type incidentTick struct {
 	evts         []evtRow
 }
 
+type footerState struct {
+	mu      sync.Mutex
+	enabled bool
+	rows    int
+	cols    int
+
+	severity    string
+	apiMs       int64
+	podSummary  string
+	nodeSummary string
+	netState    string
+
+	incidentCount   int
+	lastIncidentEnd time.Time
+	lastIncidentDur time.Duration
+	lastIncidentRsn string
+}
+
 type incident struct {
 	startedAt   time.Time
 	endedAt     time.Time
@@ -118,6 +138,10 @@ type watcher struct {
 	netCheckFunc    func() bool // injectable for tests; nil falls back to dialAny
 	localOnline     bool
 
+	footer    footerState
+	noFooter  bool
+	resizeCh  chan struct{}
+
 	pods        map[podKey]podSnap
 	initialized bool
 	seenEvents  map[string]time.Time
@@ -141,6 +165,7 @@ func main() {
 		minConfirmations int
 		netTargetsCSV    string
 		noNetCheck       bool
+		noFooter         bool
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (default: $KUBECONFIG or ~/.kube/config).")
@@ -155,6 +180,7 @@ func main() {
 	flag.IntVar(&minConfirmations, "min-confirmations", 2, "Consecutive non-OK ticks (with at least one ALERT) required to open an incident.")
 	flag.StringVar(&netTargetsCSV, "net-check-targets", "1.1.1.1:443,8.8.8.8:443", "Comma-separated TCP targets used to detect local connectivity loss; first success wins.")
 	flag.BoolVar(&noNetCheck, "no-net-check", false, "Disable local-network detection (every API failure becomes a cluster issue).")
+	flag.BoolVar(&noFooter, "no-footer", false, "Disable the sticky status footer.")
 	flag.Parse()
 
 	if recoveryTicks < 1 {
@@ -208,6 +234,8 @@ func main() {
 		minConfirmations: minConfirmations,
 		netCheckTargets:  netTargets,
 		localOnline:      true,
+		noFooter:         noFooter,
+		resizeCh:         make(chan struct{}, 1),
 		pods:             make(map[podKey]podSnap),
 		seenEvents:       make(map[string]time.Time),
 		prevNotRdy:       make(map[string]bool),
@@ -234,12 +262,22 @@ func main() {
 		interval, slowMs, alertMs, minConfirmations, recoveryTicks, notifyState, netCheckState)
 	fmt.Println(strings.Repeat("─", 80))
 
+	w.initFooter()
+	defer w.tearDownFooter()
+
 	w.run(rootCtx)
 	fmt.Printf("\n%s exiting after %d alert tick(s).\n", paint(ansiDim, "└──"), w.alertN)
 }
 
 func (w *watcher) run(ctx context.Context) {
 	defer w.forceCloseIncident()
+
+	// Periodically re-render the footer even if no tick has fired so the
+	// uptime/incident-elapsed counter advances live (rather than only on
+	// poll boundaries).
+	footerRefresh := time.NewTicker(time.Second)
+	defer footerRefresh.Stop()
+
 	w.tick(ctx) // immediate first tick
 	t := time.NewTicker(w.interval)
 	defer t.Stop()
@@ -249,11 +287,16 @@ func (w *watcher) run(ctx context.Context) {
 			return
 		case <-t.C:
 			w.tick(ctx)
+		case <-w.resizeCh:
+			w.handleResize()
+		case <-footerRefresh.C:
+			w.renderFooter()
 		}
 	}
 }
 
 func (w *watcher) tick(ctx context.Context) {
+	defer w.renderFooter()
 	now := time.Now().UTC()
 	stamp := now.Format("15:04:05Z")
 
@@ -282,6 +325,7 @@ func (w *watcher) tick(ctx context.Context) {
 					stampLabel, ctxLabel,
 					paint(ansiDim, "OFFLINE — still no local network"))
 			}
+			w.updateFooterTick("OFFLINE", rz.latency.Milliseconds(), "", "", "offline")
 			return
 		}
 	}
@@ -393,6 +437,14 @@ func (w *watcher) tick(ctx context.Context) {
 	}
 	w.recordIncident(now, severity, stripANSI(apiAlert),
 		rz.latency.Milliseconds(), notReady, deltas, evts)
+
+	nodeSummary := "ready"
+	if nodeErr == nil && len(notReady) > 0 {
+		nodeSummary = fmt.Sprintf("NotReady=%d", len(notReady))
+	} else if nodeErr != nil {
+		nodeSummary = "err"
+	}
+	w.updateFooterTick(severity, rz.latency.Milliseconds(), podSummary, nodeSummary, "online")
 }
 
 // recordIncident drives the incident state machine.
@@ -536,6 +588,13 @@ func (w *watcher) closeIncident(reason string) {
 	fmt.Printf("       %s %s closed incident (%s) duration=%s report=%s\n",
 		arrow(), paint(ansiGreen, "✓"), reason, dur, path)
 
+	w.footer.mu.Lock()
+	w.footer.incidentCount++
+	w.footer.lastIncidentEnd = inc.endedAt
+	w.footer.lastIncidentDur = dur
+	w.footer.lastIncidentRsn = reason
+	w.footer.mu.Unlock()
+
 	if w.notify {
 		title := fmt.Sprintf("k8s-cluster-health [%s] %s",
 			w.cfgContext, strings.ToUpper(reason))
@@ -548,6 +607,214 @@ func (w *watcher) forceCloseIncident() {
 	if w.cur != nil {
 		w.closeIncident("shutdown")
 	}
+}
+
+// initFooter reserves the bottom row of the terminal for a sticky status
+// footer. Implementation: set a DECSTBM scrolling region covering rows 1..R-1
+// and pin the footer at row R. Log lines printed by the program scroll within
+// the upper region, the footer line is updated in place. tmux scrollback
+// captures everything that scrolls out of the region, so scrolling up in
+// tmux still shows full history.
+//
+// If stdout isn't a TTY, the terminal is too small, or -no-footer was passed,
+// the footer is silently disabled and the program prints lines as before.
+func (w *watcher) initFooter() {
+	if w.noFooter || !useColor {
+		return
+	}
+	fd := int(os.Stdout.Fd())
+	if !term.IsTerminal(fd) {
+		return
+	}
+	cols, rows, err := term.GetSize(fd)
+	if err != nil || rows < 6 || cols < 30 {
+		return
+	}
+
+	w.footer.mu.Lock()
+	w.footer.enabled = true
+	w.footer.rows = rows
+	w.footer.cols = cols
+	w.footer.mu.Unlock()
+
+	// DECSTBM: scrolling region rows 1..(R-1). Footer pinned at row R.
+	fmt.Printf("\x1b[1;%dr", rows-1)
+	// Move cursor to bottom of scrolling region so subsequent prints scroll.
+	fmt.Printf("\x1b[%d;1H", rows-1)
+
+	go w.watchSIGWINCH()
+	w.renderFooter()
+}
+
+// tearDownFooter restores the terminal to its default scrolling region and
+// places the cursor below the footer so the shell prompt appears in a sane
+// location after the program exits. Always run via defer in main.
+func (w *watcher) tearDownFooter() {
+	w.footer.mu.Lock()
+	enabled := w.footer.enabled
+	rows := w.footer.rows
+	w.footer.enabled = false
+	w.footer.mu.Unlock()
+	if !enabled {
+		return
+	}
+	// Reset DECSTBM to default (full screen).
+	fmt.Print("\x1b[r")
+	// Move cursor below the footer row and emit a newline so the next output
+	// (typically the shell prompt) starts on a fresh line.
+	fmt.Printf("\x1b[%d;1H\n", rows)
+}
+
+// watchSIGWINCH bridges OS resize events into the main run loop so the
+// scrolling region and footer dimensions stay correct after the user resizes
+// their terminal or tmux pane.
+func (w *watcher) watchSIGWINCH() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGWINCH)
+	defer signal.Stop(ch)
+	for range ch {
+		select {
+		case w.resizeCh <- struct{}{}:
+		default:
+			// A resize is already pending in the run loop; coalesce.
+		}
+	}
+}
+
+func (w *watcher) handleResize() {
+	if !w.footer.enabled {
+		return
+	}
+	cols, rows, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || rows < 6 || cols < 30 {
+		return
+	}
+	w.footer.mu.Lock()
+	w.footer.rows = rows
+	w.footer.cols = cols
+	w.footer.mu.Unlock()
+	fmt.Printf("\x1b[1;%dr\x1b[%d;1H", rows-1, rows-1)
+	w.renderFooter()
+}
+
+// updateFooterTick records the latest tick's headline state for the footer.
+// Called from each tick exit point (offline path and normal path).
+func (w *watcher) updateFooterTick(severity string, apiMs int64, podSummary, nodeSummary, netState string) {
+	w.footer.mu.Lock()
+	w.footer.severity = severity
+	w.footer.apiMs = apiMs
+	w.footer.podSummary = podSummary
+	w.footer.nodeSummary = nodeSummary
+	w.footer.netState = netState
+	w.footer.mu.Unlock()
+}
+
+// renderFooter writes the formatted footer to its pinned row using DECSC /
+// DECRC (ESC 7 / ESC 8) to save and restore the cursor. Cheap to call
+// repeatedly; called from tick(), the per-second refresh loop, and on resize.
+func (w *watcher) renderFooter() {
+	w.footer.mu.Lock()
+	if !w.footer.enabled {
+		w.footer.mu.Unlock()
+		return
+	}
+	rows := w.footer.rows
+	cols := w.footer.cols
+	w.footer.mu.Unlock()
+
+	line := w.formatFooter()
+	line = truncateVisible(line, cols)
+
+	// ESC 7 = save cursor (DECSC); ESC 8 = restore (DECRC). More portable
+	// than CSI s / CSI u across terminals.
+	fmt.Printf("\x1b7\x1b[%d;1H\x1b[2K%s\x1b8", rows, line)
+}
+
+func (w *watcher) formatFooter() string {
+	w.footer.mu.Lock()
+	f := w.footer
+	w.footer.mu.Unlock()
+
+	uptime := time.Since(w.startedAt).Round(time.Second)
+
+	var status string
+	switch f.severity {
+	case "OK":
+		status = paint(ansiGreen+ansiBold, "OK")
+	case "WARN":
+		status = paint(ansiYellow+ansiBold, "WARN")
+	case "ALERT":
+		status = paint(ansiRed+ansiBold, "ALERT")
+	case "OFFLINE":
+		status = paint(ansiYellow+ansiBold, "OFFLINE")
+	default:
+		status = paint(ansiDim, "starting…")
+	}
+
+	parts := []string{
+		"ctx=" + paint(ansiCyan, w.cfgContext),
+		"status=" + status,
+	}
+	if f.severity != "" && f.severity != "OFFLINE" {
+		parts = append(parts, fmt.Sprintf("api=%dms", f.apiMs))
+		if f.podSummary != "" {
+			parts = append(parts, f.podSummary)
+		}
+		if f.nodeSummary != "" {
+			parts = append(parts, "nodes="+f.nodeSummary)
+		}
+	}
+	if w.cur != nil {
+		elapsed := time.Since(w.cur.startedAt).Round(time.Second)
+		parts = append(parts, paint(ansiRed+ansiBold,
+			fmt.Sprintf("INCIDENT %s (%d ticks)", elapsed, len(w.cur.ticks))))
+	} else if !f.lastIncidentEnd.IsZero() {
+		parts = append(parts, fmt.Sprintf("last=%s (%s, %s)",
+			f.lastIncidentEnd.Format("15:04Z"),
+			f.lastIncidentRsn,
+			f.lastIncidentDur))
+	}
+	parts = append(parts, fmt.Sprintf("incidents=%d", f.incidentCount))
+	parts = append(parts, "uptime="+uptime.String())
+
+	return strings.Join(parts, " │ ")
+}
+
+// truncateVisible trims s so its visible width (excluding ANSI escapes) does
+// not exceed max. ANSI escape sequences are preserved verbatim and don't
+// count toward the width. Appends a reset and ellipsis when truncation is
+// needed so the footer doesn't bleed colour into surrounding text.
+func truncateVisible(s string, max int) string {
+	visible := stripANSI(s)
+	if len([]rune(visible)) <= max {
+		return s
+	}
+	var out strings.Builder
+	visCount := 0
+	inEsc := false
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if inEsc {
+			out.WriteByte(b)
+			if (b >= 0x40 && b <= 0x7e) && b != '[' {
+				inEsc = false
+			}
+			continue
+		}
+		if b == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			inEsc = true
+			out.WriteByte(b)
+			continue
+		}
+		if visCount >= max-1 {
+			break
+		}
+		out.WriteByte(b)
+		visCount++
+	}
+	out.WriteString(ansiReset)
+	out.WriteRune('…')
+	return out.String()
 }
 
 // localNetUp returns true if the local machine appears to have working

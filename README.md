@@ -44,6 +44,7 @@ Requires Go 1.25+. The binary is ~50 MB (statically links `client-go`).
 | `-min-confirmations` | `2` | Consecutive non-OK ticks (with at least one ALERT) required to open an incident |
 | `-net-check-targets` | `1.1.1.1:443,8.8.8.8:443` | Comma-separated TCP targets used to detect local connectivity loss; first success wins |
 | `-no-net-check` | off | Disable local-network detection (every API failure becomes a cluster issue) |
+| `-no-footer` | off | Disable the sticky status footer |
 
 ## How it works
 
@@ -124,6 +125,30 @@ k8s-cluster-health context=my-cluster server=https://kube-api.example.local:6443
 
 Each tick line includes the context name after the timestamp so you can run multiple instances in tmux panes and see at a glance which cluster is reporting.
 
+### Sticky status footer
+
+When stdout is a TTY, the watcher pins a single-line status footer to the bottom of the terminal. It shows live state at a glance:
+
+```
+ctx=my-cluster │ status=OK │ api=92ms │ pods=75/75 │ nodes=ready │ incidents=0 │ uptime=12m4s
+```
+
+During an active incident the footer changes to:
+
+```
+ctx=my-cluster │ status=ALERT │ api=8127ms │ pods=73/75 │ nodes=ready │ INCIDENT 2m15s (14 ticks) │ incidents=2 │ uptime=1h7m
+```
+
+After an incident closes:
+
+```
+ctx=my-cluster │ status=OK │ api=92ms │ pods=75/75 │ nodes=ready │ last=14:42Z (recovered, 7m12s) │ incidents=3 │ uptime=1h14m
+```
+
+Implementation: the watcher sets a DECSTBM scrolling region covering rows 1..R-1 of the terminal, and re-renders the footer at row R using save/restore cursor escapes. **Log output scrolls within the upper region only — the footer stays pinned, and tmux scrollback still captures everything that scrolls out, so scrolling up to see prior history works exactly as before.** `uptime` and the live `INCIDENT <elapsed>` counter advance every second even between poll ticks.
+
+The footer is automatically disabled when stdout isn't a TTY (e.g., piped to `tee`), when the terminal is too small (<6 rows or <30 cols), or when `-no-footer` is set. SIGWINCH (terminal resize) is handled — the scrolling region is reset to the new dimensions and the footer is redrawn.
+
 ### Local connectivity detection
 
 If the API probe errors out (EOF, dial timeout, DNS failure), the watcher does a quick TCP dial to a list of well-known external hosts (`-net-check-targets`, default `1.1.1.1:443,8.8.8.8:443`) with a 1-second timeout per target. First success wins. If *all* targets fail, the local machine is presumed offline; the tick renders as `OFFLINE` and the incident state machine is **paused** for that tick — no escalation, no notifications, no changes to the pending buffer or any open incident.
@@ -187,6 +212,11 @@ The test suite covers the pure / parsing functions:
 - `TestDialAnyAllUnreachable` — RFC 5737 TEST-NET-1 addresses fail dialing; offline detection works as expected.
 - `TestDialAnyOneSucceeds` — a mix of unreachable + a live local listener returns `true` (first success wins).
 - `TestLocalNetUpUsesInjectedFunc` and `TestLocalNetUpDefaultsToTrueWithNoTargets` — verify the injectable hook used by tests and the safe default when no check is configured.
+- `TestTruncateVisibleNoTruncationNeeded`, `TestTruncateVisibleStripsAnsiFromCount`, `TestTruncateVisibleTruncates`, `TestTruncateVisiblePreservesAnsiButTruncatesText` — the footer's visible-width truncation handles ANSI escapes correctly (escapes don't count toward width; truncation appends a reset + ellipsis so colour doesn't bleed).
+- `TestFormatFooterShowsSeverity` — footer renders status, api, pods, nodes, incident count, uptime.
+- `TestFormatFooterShowsActiveIncident` — during an active incident, the footer shows `INCIDENT <elapsed> (N ticks)` instead of the last-incident summary.
+- `TestFormatFooterShowsLastIncident` — after closure, the footer shows `last=<HH:MMZ> (<reason>, <duration>)`.
+- `TestFormatFooterOfflineHidesPodApi` — when offline, the footer suppresses api/pods/nodes (since their values are stale).
 
 The Kubernetes API client itself is not mocked; the live-cluster paths (`scanPods`, `scanNodes`, `scanEvents`, `probeReadyz`) are exercised via the smoke run described below.
 

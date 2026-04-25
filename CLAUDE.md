@@ -50,6 +50,16 @@ Notification + terminal bell fire only at the moment of escalation (incident ope
 
 The report file is markdown with three sections — header, summary, timeline — in that order, for paste-ready use in provider support tickets. Don't reorder these sections; ticketing systems and humans both scan the header first. Keep the file extension `.md` (Linode/AWS/GitHub all render markdown in tickets).
 
+## Sticky footer
+
+Implementation uses DECSTBM (`\x1b[1;<R-1>r`) to define a scrolling region covering rows 1..R-1 with the footer pinned at row R. Footer updates use DECSC/DECRC (`\x1b7`/`\x1b8`) save-and-restore cursor escapes — these are more portable than CSI s/u and work in tmux + most VT100-compatible terminals. **Do not switch to the alternate screen buffer (smcup/`\x1b[?1049h`)** — it disables tmux/terminal scrollback for the duration of the program, which breaks the user's ability to scroll up and see prior log lines. The whole point of using DECSTBM is to keep main-buffer scrollback working.
+
+The footer state is mutex-protected (`footer.mu`) because three callers update or read it: `tick()` from the run loop, `closeIncident()` (also from the run loop, but renders may interleave), and `handleResize()` from the run loop after SIGWINCH bridges through `resizeCh`. Don't render the footer from the SIGWINCH goroutine directly — it bridges through `resizeCh` so all rendering happens on the main goroutine.
+
+A 1-second `footerRefresh` ticker re-renders the footer between poll ticks so `uptime` and the active-incident `elapsed` counter visibly advance. This is intentional UX; don't remove it for "efficiency" — terminal cursor save/restore is microseconds.
+
+The footer is silently disabled when: not a TTY (`!useColor`), terminal too small (<6 rows or <30 cols), or `-no-footer` is passed. In any of those cases, log lines print as before with no scrolling-region setup. `tearDownFooter` (deferred from `main`) resets DECSTBM with `\x1b[r` so the user's shell isn't left with a constrained scrolling region after exit.
+
 ## Local connectivity detection
 
 When the API probe errors, do a quick TCP dial to the configured `netCheckTargets` (default `1.1.1.1:443`, `8.8.8.8:443`) with a 1-second per-target timeout. First success wins. If all fail, render `OFFLINE` and skip all incident state machine logic for that tick — pending buffer preserved, open incident preserved, recovery streak preserved. When the next tick succeeds, print `ONLINE — local network restored` and resume.
