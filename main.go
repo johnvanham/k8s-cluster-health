@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -113,6 +114,10 @@ type watcher struct {
 	cur              *incident
 	pending          []incidentTick
 
+	netCheckTargets []string
+	netCheckFunc    func() bool // injectable for tests; nil falls back to dialAny
+	localOnline     bool
+
 	pods        map[podKey]podSnap
 	initialized bool
 	seenEvents  map[string]time.Time
@@ -134,6 +139,8 @@ func main() {
 		logDir           string
 		recoveryTicks    int
 		minConfirmations int
+		netTargetsCSV    string
+		noNetCheck       bool
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (default: $KUBECONFIG or ~/.kube/config).")
@@ -146,6 +153,8 @@ func main() {
 	flag.StringVar(&logDir, "log-dir", ".", "Directory to write incident reports.")
 	flag.IntVar(&recoveryTicks, "recovery-ticks", 3, "Consecutive OK ticks required to close an incident.")
 	flag.IntVar(&minConfirmations, "min-confirmations", 2, "Consecutive non-OK ticks (with at least one ALERT) required to open an incident.")
+	flag.StringVar(&netTargetsCSV, "net-check-targets", "1.1.1.1:443,8.8.8.8:443", "Comma-separated TCP targets used to detect local connectivity loss; first success wins.")
+	flag.BoolVar(&noNetCheck, "no-net-check", false, "Disable local-network detection (every API failure becomes a cluster issue).")
 	flag.Parse()
 
 	if recoveryTicks < 1 {
@@ -175,6 +184,15 @@ func main() {
 
 	notifyOK := !noNotify && notifyAvailable()
 
+	var netTargets []string
+	if !noNetCheck {
+		for _, t := range strings.Split(netTargetsCSV, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				netTargets = append(netTargets, t)
+			}
+		}
+	}
+
 	w := &watcher{
 		cs:               cs,
 		httpClient:       hc,
@@ -188,6 +206,8 @@ func main() {
 		logDir:           logDir,
 		recoveryTicks:    recoveryTicks,
 		minConfirmations: minConfirmations,
+		netCheckTargets:  netTargets,
+		localOnline:      true,
 		pods:             make(map[podKey]podSnap),
 		seenEvents:       make(map[string]time.Time),
 		prevNotRdy:       make(map[string]bool),
@@ -203,11 +223,15 @@ func main() {
 	default:
 		notifyState = "unavailable"
 	}
-	fmt.Printf("%s context=%s server=%s interval=%s slow=%dms alert=%dms confirm=%d recover=%d notify=%s\n",
+	netCheckState := "off"
+	if len(netTargets) > 0 {
+		netCheckState = strings.Join(netTargets, ",")
+	}
+	fmt.Printf("%s context=%s server=%s interval=%s slow=%dms alert=%dms confirm=%d recover=%d notify=%s net-check=%s\n",
 		paint(ansiBold, "k8s-cluster-health"),
 		paint(ansiCyan, ctxName),
 		paint(ansiDim, w.apiHost),
-		interval, slowMs, alertMs, minConfirmations, recoveryTicks, notifyState)
+		interval, slowMs, alertMs, minConfirmations, recoveryTicks, notifyState, netCheckState)
 	fmt.Println(strings.Repeat("─", 80))
 
 	w.run(rootCtx)
@@ -236,6 +260,38 @@ func (w *watcher) tick(ctx context.Context) {
 	rzCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	rz := w.probeReadyz(rzCtx)
 	cancel()
+
+	// Disambiguate API failure vs. local network outage. If the API probe
+	// errored and a quick dial to a well-known external host also fails,
+	// treat this tick as OFFLINE — render a status line, do NOT escalate,
+	// preserve the pending buffer and any open incident as-is. This stops
+	// transient local wifi drops from generating bogus cluster alerts.
+	if rz.err != nil && (len(w.netCheckTargets) > 0 || w.netCheckFunc != nil) {
+		online := w.localNetUp()
+		if !online {
+			ctxLabel := paint(ansiCyan, w.cfgContext)
+			stampLabel := paint(ansiDim, "["+stamp+"]")
+			if w.localOnline {
+				fmt.Printf("%s %s %s — local network unreachable, pausing checks (%s)\n",
+					stampLabel, ctxLabel,
+					paint(ansiYellow+ansiBold, "OFFLINE"),
+					truncate(rz.err.Error(), 100))
+				w.localOnline = false
+			} else {
+				fmt.Printf("%s %s %s\n",
+					stampLabel, ctxLabel,
+					paint(ansiDim, "OFFLINE — still no local network"))
+			}
+			return
+		}
+	}
+	if !w.localOnline {
+		fmt.Printf("%s %s %s\n",
+			paint(ansiDim, "["+stamp+"]"),
+			paint(ansiCyan, w.cfgContext),
+			paint(ansiGreen+ansiBold, "ONLINE — local network restored"))
+		w.localOnline = true
+	}
 
 	podCtx, cancel2 := context.WithTimeout(ctx, 15*time.Second)
 	deltas, podSummary, podErr := w.scanPods(podCtx)
@@ -492,6 +548,47 @@ func (w *watcher) forceCloseIncident() {
 	if w.cur != nil {
 		w.closeIncident("shutdown")
 	}
+}
+
+// localNetUp returns true if the local machine appears to have working
+// network connectivity. Tests can inject netCheckFunc directly; production
+// uses dialAny on netCheckTargets.
+func (w *watcher) localNetUp() bool {
+	if w.netCheckFunc != nil {
+		return w.netCheckFunc()
+	}
+	if len(w.netCheckTargets) == 0 {
+		return true
+	}
+	return dialAny(w.netCheckTargets, time.Second)
+}
+
+// dialAny dials each target concurrently with the given per-dial timeout and
+// returns true as soon as one connection succeeds. Goroutines for slower
+// targets continue running until their dial completes; the buffered channel
+// ensures they never block.
+func dialAny(targets []string, perTimeout time.Duration) bool {
+	if len(targets) == 0 {
+		return true
+	}
+	ch := make(chan bool, len(targets))
+	for _, t := range targets {
+		go func(t string) {
+			c, err := net.DialTimeout("tcp", t, perTimeout)
+			if err != nil {
+				ch <- false
+				return
+			}
+			_ = c.Close()
+			ch <- true
+		}(t)
+	}
+	for i := 0; i < len(targets); i++ {
+		if <-ch {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *watcher) probeReadyz(ctx context.Context) readyz {

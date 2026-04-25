@@ -50,6 +50,14 @@ Notification + terminal bell fire only at the moment of escalation (incident ope
 
 The report file is markdown with three sections — header, summary, timeline — in that order, for paste-ready use in provider support tickets. Don't reorder these sections; ticketing systems and humans both scan the header first. Keep the file extension `.md` (Linode/AWS/GitHub all render markdown in tickets).
 
+## Local connectivity detection
+
+When the API probe errors, do a quick TCP dial to the configured `netCheckTargets` (default `1.1.1.1:443`, `8.8.8.8:443`) with a 1-second per-target timeout. First success wins. If all fail, render `OFFLINE` and skip all incident state machine logic for that tick — pending buffer preserved, open incident preserved, recovery streak preserved. When the next tick succeeds, print `ONLINE — local network restored` and resume.
+
+Don't get clever about diagnosing the *cause* of the local outage (DNS vs. TCP vs. TLS vs. proxy). The dialAny check is a binary "can I reach anything on the public internet" probe; that's enough to distinguish "my wifi is down" from "the cluster is down". For users behind a firewall that blocks both targets, expose `-net-check-targets` so they can substitute reachable hosts; for users who explicitly want every API failure treated as a cluster issue, expose `-no-net-check`.
+
+The injectable `netCheckFunc` field on `watcher` is purely for tests. Don't repurpose it as a runtime override; flags are the user-facing surface.
+
 ## What's deliberately absent
 
 Don't add unless the user asks for it:

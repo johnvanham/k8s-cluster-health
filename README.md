@@ -42,6 +42,8 @@ Requires Go 1.25+. The binary is ~50 MB (statically links `client-go`).
 | `-log-dir` | `.` | Directory to write incident reports |
 | `-recovery-ticks` | `3` | Consecutive OK ticks required to close an incident |
 | `-min-confirmations` | `2` | Consecutive non-OK ticks (with at least one ALERT) required to open an incident |
+| `-net-check-targets` | `1.1.1.1:443,8.8.8.8:443` | Comma-separated TCP targets used to detect local connectivity loss; first success wins |
+| `-no-net-check` | off | Disable local-network detection (every API failure becomes a cluster issue) |
 
 ## How it works
 
@@ -122,6 +124,18 @@ k8s-cluster-health context=my-cluster server=https://kube-api.example.local:6443
 
 Each tick line includes the context name after the timestamp so you can run multiple instances in tmux panes and see at a glance which cluster is reporting.
 
+### Local connectivity detection
+
+If the API probe errors out (EOF, dial timeout, DNS failure), the watcher does a quick TCP dial to a list of well-known external hosts (`-net-check-targets`, default `1.1.1.1:443,8.8.8.8:443`) with a 1-second timeout per target. First success wins. If *all* targets fail, the local machine is presumed offline; the tick renders as `OFFLINE` and the incident state machine is **paused** for that tick — no escalation, no notifications, no changes to the pending buffer or any open incident.
+
+When the local network comes back, a one-line `ONLINE — local network restored` is printed and normal polling resumes. This means:
+
+- A wifi blip during a tick → `OFFLINE` line, no false alarm.
+- A wifi blip during an open incident → incident timeline is preserved; no spurious "restart" or "event" entries get appended; recovery streak isn't reset.
+- A long local outage (laptop suspend, train tunnel, etc.) → repeated `OFFLINE` lines but no incident churn; clean resumption when connectivity returns.
+
+Pass `-no-net-check` to disable this entirely (every API failure is then treated as a real cluster issue, like before).
+
 ### What it specifically catches
 
 | Signal | Surfaced as |
@@ -169,6 +183,10 @@ The test suite covers the pure / parsing functions:
 - `TestDebounceWarnPreambleIncludedInIncident` — a WARN immediately followed by an ALERT crosses the threshold and the WARN is folded in as preamble (start time is the WARN).
 - `TestDebounceWarnOnlySequenceNeverOpens` — a long WARN-only sequence never opens an incident, and the pending buffer stays bounded.
 - `TestDebounceAlertResetsOnOK` — two isolated ALERTs separated by an OK are each treated as transient blips; nothing escalates.
+- `TestDialAnyEmptyTargetsTreatedAsUp` — with no targets configured, `dialAny` returns `true` (treat as online).
+- `TestDialAnyAllUnreachable` — RFC 5737 TEST-NET-1 addresses fail dialing; offline detection works as expected.
+- `TestDialAnyOneSucceeds` — a mix of unreachable + a live local listener returns `true` (first success wins).
+- `TestLocalNetUpUsesInjectedFunc` and `TestLocalNetUpDefaultsToTrueWithNoTargets` — verify the injectable hook used by tests and the safe default when no check is configured.
 
 The Kubernetes API client itself is not mocked; the live-cluster paths (`scanPods`, `scanNodes`, `scanEvents`, `probeReadyz`) are exercised via the smoke run described below.
 

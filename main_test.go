@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -404,6 +405,49 @@ func TestDebounceAlertResetsOnOK(t *testing.T) {
 	w.recordIncident(t0.Add(20*time.Second), "ALERT", "blip 2", 5000, nil, nil, nil)
 	if w.cur != nil {
 		t.Fatal("two isolated ALERTs separated by OK should NOT open an incident")
+	}
+}
+
+func TestDialAnyEmptyTargetsTreatedAsUp(t *testing.T) {
+	if !dialAny(nil, 100*time.Millisecond) {
+		t.Error("nil targets should return true (no check configured)")
+	}
+}
+
+func TestDialAnyAllUnreachable(t *testing.T) {
+	// 192.0.2.0/24 is RFC 5737 TEST-NET-1, never routes on the public internet.
+	if dialAny([]string{"192.0.2.1:1", "192.0.2.2:1"}, 200*time.Millisecond) {
+		t.Error("expected unreachable RFC 5737 addresses to fail dialAny")
+	}
+}
+
+func TestDialAnyOneSucceeds(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	if !dialAny([]string{"192.0.2.1:1", ln.Addr().String()}, 300*time.Millisecond) {
+		t.Error("expected at least one target to succeed")
+	}
+}
+
+func TestLocalNetUpUsesInjectedFunc(t *testing.T) {
+	w := &watcher{netCheckFunc: func() bool { return true }}
+	if !w.localNetUp() {
+		t.Error("injected func returning true should be honoured")
+	}
+	w.netCheckFunc = func() bool { return false }
+	if w.localNetUp() {
+		t.Error("injected func returning false should be honoured")
+	}
+}
+
+func TestLocalNetUpDefaultsToTrueWithNoTargets(t *testing.T) {
+	w := &watcher{}
+	if !w.localNetUp() {
+		t.Error("with no targets and no injected func, expect 'up' default")
 	}
 }
 
