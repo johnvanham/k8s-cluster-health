@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -76,17 +77,39 @@ type readyz struct {
 	latency    time.Duration
 }
 
+type incidentTick struct {
+	when         time.Time
+	severity     string // "ALERT" / "WARN" / "OK"
+	apiLatencyMs int64
+	apiAlert     string // ANSI-stripped summary, may be empty
+	notReady     []string
+	deltas       []restartDelta
+	evts         []evtRow
+}
+
+type incident struct {
+	startedAt   time.Time
+	endedAt     time.Time
+	lastNonOKAt time.Time
+	firstOKAt   time.Time
+	okStreak    int
+	ticks       []incidentTick
+}
+
 type watcher struct {
 	cs         *kubernetes.Clientset
 	httpClient *http.Client
 	apiHost    string
 	cfgContext string
 
-	interval time.Duration
-	slowMs   int64
-	alertMs  int64
-	silent   bool
-	notify   bool
+	interval      time.Duration
+	slowMs        int64
+	alertMs       int64
+	silent        bool
+	notify        bool
+	logDir        string
+	recoveryTicks int
+	cur           *incident
 
 	pods        map[podKey]podSnap
 	initialized bool
@@ -99,13 +122,15 @@ type watcher struct {
 
 func main() {
 	var (
-		kubeconfig string
-		kubectx    string
-		interval   time.Duration
-		slowMs     int64
-		alertMs    int64
-		silent     bool
-		noNotify   bool
+		kubeconfig    string
+		kubectx       string
+		interval      time.Duration
+		slowMs        int64
+		alertMs       int64
+		silent        bool
+		noNotify      bool
+		logDir        string
+		recoveryTicks int
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (default: $KUBECONFIG or ~/.kube/config).")
@@ -115,7 +140,13 @@ func main() {
 	flag.Int64Var(&alertMs, "alert-ms", 3000, "API latency threshold for ALERT (ms).")
 	flag.BoolVar(&silent, "no-bell", false, "Do not ring the terminal bell on alerts.")
 	flag.BoolVar(&noNotify, "no-notify", false, "Do not send desktop notifications via notify-send.")
+	flag.StringVar(&logDir, "log-dir", ".", "Directory to write incident reports.")
+	flag.IntVar(&recoveryTicks, "recovery-ticks", 3, "Consecutive OK ticks required to close an incident.")
 	flag.Parse()
+
+	if recoveryTicks < 1 {
+		recoveryTicks = 1
+	}
 
 	cfg, ctxName, err := buildConfig(kubeconfig, kubectx)
 	if err != nil {
@@ -138,19 +169,21 @@ func main() {
 	notifyOK := !noNotify && notifyAvailable()
 
 	w := &watcher{
-		cs:         cs,
-		httpClient: hc,
-		apiHost:    strings.TrimRight(cfg.Host, "/"),
-		cfgContext: ctxName,
-		interval:   interval,
-		slowMs:     slowMs,
-		alertMs:    alertMs,
-		silent:     silent,
-		notify:     notifyOK,
-		pods:       make(map[podKey]podSnap),
-		seenEvents: make(map[string]time.Time),
-		prevNotRdy: make(map[string]bool),
-		startedAt:  time.Now().UTC(),
+		cs:            cs,
+		httpClient:    hc,
+		apiHost:       strings.TrimRight(cfg.Host, "/"),
+		cfgContext:    ctxName,
+		interval:      interval,
+		slowMs:        slowMs,
+		alertMs:       alertMs,
+		silent:        silent,
+		notify:        notifyOK,
+		logDir:        logDir,
+		recoveryTicks: recoveryTicks,
+		pods:          make(map[podKey]podSnap),
+		seenEvents:    make(map[string]time.Time),
+		prevNotRdy:    make(map[string]bool),
+		startedAt:     time.Now().UTC(),
 	}
 
 	notifyState := "off"
@@ -174,6 +207,7 @@ func main() {
 }
 
 func (w *watcher) run(ctx context.Context) {
+	defer w.forceCloseIncident()
 	w.tick(ctx) // immediate first tick
 	t := time.NewTicker(w.interval)
 	defer t.Stop()
@@ -298,6 +332,107 @@ func (w *watcher) tick(ctx context.Context) {
 		}
 		body := buildNotifyBody(stripANSI(apiAlert), notReady, deltas, evts)
 		go sendNotification(title, body, urgency)
+	}
+
+	severity := "OK"
+	switch {
+	case hasAlert:
+		severity = "ALERT"
+	case hasWarn:
+		severity = "WARN"
+	}
+	w.recordIncident(now, severity, stripANSI(apiAlert),
+		rz.latency.Milliseconds(), notReady, deltas, evts)
+}
+
+// recordIncident drives the incident state machine. Opens an incident on the
+// first ALERT tick, appends every subsequent tick (WARN and OK included) to
+// the active incident's timeline, and closes when recoveryTicks consecutive
+// OK ticks have been seen. The closing tick's "end time" is the timestamp of
+// the first OK after the last non-OK tick, so duration reflects how long the
+// cluster was actually unhealthy rather than how long the recovery probe ran.
+func (w *watcher) recordIncident(now time.Time, severity, apiAlert string,
+	latencyMs int64, notReady []string, deltas []restartDelta, evts []evtRow) {
+
+	isOK := severity == "OK"
+	if w.cur == nil {
+		if severity != "ALERT" {
+			return
+		}
+		w.cur = &incident{startedAt: now}
+		fmt.Printf("       %s %s opened incident at %s\n",
+			arrow(), paint(ansiYellow, "↻"), now.Format("15:04:05Z"))
+	}
+
+	w.cur.ticks = append(w.cur.ticks, incidentTick{
+		when:         now,
+		severity:     severity,
+		apiLatencyMs: latencyMs,
+		apiAlert:     apiAlert,
+		notReady:     append([]string(nil), notReady...),
+		deltas:       append([]restartDelta(nil), deltas...),
+		evts:         append([]evtRow(nil), evts...),
+	})
+
+	if isOK {
+		w.cur.okStreak++
+		if w.cur.firstOKAt.IsZero() {
+			w.cur.firstOKAt = now
+		}
+		if w.cur.okStreak >= w.recoveryTicks {
+			w.cur.endedAt = w.cur.firstOKAt
+			w.closeIncident("recovered")
+		}
+		return
+	}
+	w.cur.lastNonOKAt = now
+	w.cur.firstOKAt = time.Time{}
+	w.cur.okStreak = 0
+}
+
+// closeIncident finalises the active incident, writes the markdown report,
+// and clears state. reason is included in the closing log line ("recovered"
+// or "shutdown").
+func (w *watcher) closeIncident(reason string) {
+	if w.cur == nil {
+		return
+	}
+	inc := w.cur
+	w.cur = nil
+
+	if inc.endedAt.IsZero() {
+		if !inc.lastNonOKAt.IsZero() {
+			inc.endedAt = inc.lastNonOKAt
+		} else if len(inc.ticks) > 0 {
+			inc.endedAt = inc.ticks[len(inc.ticks)-1].when
+		} else {
+			inc.endedAt = time.Now().UTC()
+		}
+	}
+
+	ts := inc.startedAt.UTC().Format("2006-01-02T15-04-05Z")
+	path := filepath.Join(w.logDir, "incident-"+ts+".md")
+	if err := writeIncidentReport(path, w.cfgContext, w.apiHost, reason, inc); err != nil {
+		fmt.Fprintf(os.Stderr, "%s failed to write incident report %s: %v\n",
+			paint(ansiRed, "ERR"), path, err)
+		return
+	}
+
+	dur := inc.endedAt.Sub(inc.startedAt).Round(time.Second)
+	fmt.Printf("       %s %s closed incident (%s) duration=%s report=%s\n",
+		arrow(), paint(ansiGreen, "✓"), reason, dur, path)
+
+	if w.notify {
+		title := fmt.Sprintf("k8s-cluster-health [%s] %s",
+			w.cfgContext, strings.ToUpper(reason))
+		body := fmt.Sprintf("Incident closed after %s\nReport: %s", dur, path)
+		go sendNotification(title, body, "normal")
+	}
+}
+
+func (w *watcher) forceCloseIncident() {
+	if w.cur != nil {
+		w.closeIncident("shutdown")
 	}
 }
 
@@ -601,3 +736,131 @@ func buildNotifyBody(apiSummary string, notReady []string, deltas []restartDelta
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }
+
+// writeIncidentReport renders a markdown report of the incident, suitable for
+// pasting into a provider support ticket (Linode, AWS, etc.). Sections:
+// header, summary aggregates, full per-tick timeline.
+func writeIncidentReport(path, ctxName, apiHost, closeReason string, inc *incident) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var nAlert, nWarn, nOK int
+	var maxLatency int64
+	apiFailures := map[string]int{}
+	restartsByPod := map[string]int32{}
+	finalCountByPod := map[string]int32{}
+	notReadySet := map[string]bool{}
+	eventReasons := map[string]string{}
+	for _, t := range inc.ticks {
+		switch t.severity {
+		case "ALERT":
+			nAlert++
+		case "WARN":
+			nWarn++
+		case "OK":
+			nOK++
+		}
+		if t.apiLatencyMs > maxLatency {
+			maxLatency = t.apiLatencyMs
+		}
+		if t.apiAlert != "" {
+			apiFailures[t.apiAlert]++
+		}
+		for _, n := range t.notReady {
+			notReadySet[n] = true
+		}
+		for _, d := range t.deltas {
+			k := d.ns + "/" + d.name
+			restartsByPod[k] += d.delta
+			finalCountByPod[k] = d.total
+		}
+		for _, e := range t.evts {
+			if _, ok := eventReasons[e.reason]; !ok {
+				eventReasons[e.reason] = e.msg
+			}
+		}
+	}
+
+	dur := inc.endedAt.Sub(inc.startedAt).Round(time.Second)
+	fmt.Fprintf(f, "# Cluster instability incident — %s\n\n", inc.startedAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(f, "- **Cluster context:** `%s`\n", ctxName)
+	fmt.Fprintf(f, "- **API server:** `%s`\n", apiHost)
+	fmt.Fprintf(f, "- **Started (UTC):** %s\n", inc.startedAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(f, "- **Ended (UTC):** %s\n", inc.endedAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(f, "- **Duration:** %s\n", dur)
+	fmt.Fprintf(f, "- **Closed reason:** %s\n", closeReason)
+	fmt.Fprintf(f, "- **Tool:** k8s-cluster-health (https://github.com/johnvanham/k8s-cluster-health)\n\n")
+
+	fmt.Fprintln(f, "## Summary")
+	fmt.Fprintln(f)
+	fmt.Fprintf(f, "- Tick severity counts: **%d ALERT**, **%d WARN**, **%d OK** (recovery)\n", nAlert, nWarn, nOK)
+	fmt.Fprintf(f, "- Max observed API latency: **%d ms**\n", maxLatency)
+	if len(apiFailures) > 0 {
+		fmt.Fprintln(f, "- API-server failure signatures observed:")
+		for _, k := range sortedKeys(apiFailures) {
+			fmt.Fprintf(f, "  - `%s` × %d\n", k, apiFailures[k])
+		}
+	} else {
+		fmt.Fprintln(f, "- API-server failure signatures observed: none")
+	}
+	if len(restartsByPod) > 0 {
+		fmt.Fprintf(f, "- Distinct pods with restart-count increases: **%d**\n", len(restartsByPod))
+		for _, k := range sortedKeys(restartsByPod) {
+			fmt.Fprintf(f, "  - `%s` +%d (final restart count %d)\n",
+				k, restartsByPod[k], finalCountByPod[k])
+		}
+	}
+	if len(notReadySet) > 0 {
+		fmt.Fprintf(f, "- Nodes that went NotReady: **%d**\n", len(notReadySet))
+		for _, n := range sortedBoolKeys(notReadySet) {
+			fmt.Fprintf(f, "  - `%s`\n", n)
+		}
+	}
+	if len(eventReasons) > 0 {
+		fmt.Fprintf(f, "- Distinct Warning event reason(s): **%d**\n", len(eventReasons))
+		for _, r := range sortedStringKeys(eventReasons) {
+			fmt.Fprintf(f, "  - **%s** — first seen: %s\n", r, truncate(oneLine(eventReasons[r]), 240))
+		}
+	}
+	fmt.Fprintln(f)
+
+	fmt.Fprintln(f, "## Timeline")
+	fmt.Fprintln(f)
+	for _, t := range inc.ticks {
+		latency := fmt.Sprintf("%dms", t.apiLatencyMs)
+		fmt.Fprintf(f, "### %s — %s (api=%s)\n", t.when.UTC().Format("15:04:05Z"), t.severity, latency)
+		if t.apiAlert != "" {
+			fmt.Fprintf(f, "- %s\n", t.apiAlert)
+		}
+		for _, n := range t.notReady {
+			fmt.Fprintf(f, "- NotReady node: `%s`\n", n)
+		}
+		for _, d := range t.deltas {
+			fmt.Fprintf(f, "- Pod restart: `%s/%s` +%d (now %d)\n", d.ns, d.name, d.delta, d.total)
+		}
+		for _, e := range t.evts {
+			fmt.Fprintf(f, "- Event: `%s/%s` [%s] %s\n",
+				e.ns, e.obj, e.reason, truncate(oneLine(e.msg), 300))
+		}
+		fmt.Fprintln(f)
+	}
+	return nil
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedBoolKeys(m map[string]bool) []string   { return sortedKeys(m) }
+func sortedStringKeys(m map[string]string) []string { return sortedKeys(m) }

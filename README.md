@@ -39,6 +39,8 @@ Requires Go 1.25+. The binary is ~50 MB (statically links `client-go`).
 | `-alert-ms` | `3000` | API latency threshold for `ALERT` |
 | `-no-bell` | off | Suppress terminal bell on alerts |
 | `-no-notify` | off | Suppress GNOME desktop notifications |
+| `-log-dir` | `.` | Directory to write incident reports |
+| `-recovery-ticks` | `3` | Consecutive OK ticks required to close an incident |
 
 ## How it works
 
@@ -59,6 +61,34 @@ The tick severity is the worst signal seen:
 - `ALERT` (red) — API latency above `alert-ms`, or `/readyz` non-2xx, or any pod restart, NotReady node, or new warning event.
 
 On `ALERT` ticks (and `WARN` for slow-API), it pushes a `notify-send` desktop notification (critical / normal urgency) with up to four restart entries and four event entries, plus the API failure summary. The terminal bell is also rung on `ALERT` ticks if the output is a TTY. The notification is sent in a goroutine with a 5s timeout — never blocks the poll loop.
+
+### Incident reports
+
+When an `ALERT` tick fires, the watcher opens an **incident** and starts collecting every subsequent tick (ALERT, WARN, and OK) until it sees `-recovery-ticks` (default 3) consecutive OK ticks. On close, it writes a markdown report to `-log-dir` (default current directory) named `incident-<UTC-start>.md`.
+
+- **Start time** = timestamp of the first ALERT tick.
+- **End time** = timestamp of the *first* OK tick after the last non-OK tick (so the duration reflects how long the cluster was actually unhealthy, not how long the recovery probe ran).
+- **Closed reason** = `recovered` for normal close, `shutdown` if the program is killed mid-incident (a partial report is still written so SIGINT doesn't lose data).
+- A new ALERT or WARN during the recovery streak resets the OK counter — the incident stays open.
+
+The report has three sections, ordered for ticket-pasting:
+
+1. **Header** — context, API server, start/end (UTC, RFC 3339), duration, close reason.
+2. **Summary** — tick severity counts, max API latency, deduplicated API failure signatures with counts, distinct pods that restarted (with cumulative delta and final restart count), NotReady nodes, distinct Warning event reasons with their first observed message.
+3. **Timeline** — full per-tick detail: API status, NotReady nodes, pod restarts, individual warning events.
+
+Sample header (truncated):
+
+```markdown
+# Cluster instability incident — 2026-04-25T12:34:56Z
+
+- **Cluster context:** `my-cluster`
+- **API server:** `https://kube-api.example.local:6443`
+- **Started (UTC):** 2026-04-25T12:34:56Z
+- **Ended (UTC):** 2026-04-25T12:42:11Z
+- **Duration:** 7m15s
+- **Closed reason:** recovered
+```
 
 ### Sample output
 
@@ -112,6 +142,10 @@ The test suite covers the pure / parsing functions:
 - `TestLastSeen` — preference order `LastTimestamp > EventTime > CreationTimestamp` for event timestamps.
 - `TestScanPodsDetectsRestartDelta` — the restart-delta arithmetic used inside `scanPods`.
 - `TestPaintNoColorPassthrough` — colour helper passes strings through unchanged when stdout isn't a TTY.
+- `TestIncidentOpensOnAlertOnly` — WARN and OK ticks alone don't open an incident; only ALERT does.
+- `TestIncidentClosesAfterRecoveryTicks` — incident closes after `recoveryTicks` consecutive OKs, end time is the *first* OK after the last non-OK, duration reflects the unhealthy window, and the report contains the expected aggregates.
+- `TestIncidentNonOKResetsRecoveryStreak` — a new ALERT/WARN mid-recovery resets the OK counter; the incident stays open until 3 OKs occur back-to-back.
+- `TestForceCloseOnShutdown` — `forceCloseIncident` writes a report with `Closed reason: shutdown` so SIGINT mid-incident still produces a usable artefact.
 
 The Kubernetes API client itself is not mocked; the live-cluster paths (`scanPods`, `scanNodes`, `scanEvents`, `probeReadyz`) are exercised via the smoke run described below.
 

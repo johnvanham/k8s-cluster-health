@@ -42,6 +42,12 @@ Tests exercise pure functions only. The Kubernetes API client is not mocked; liv
 - **Severity vocabulary.** `OK` / `WARN` / `ALERT`. Don't introduce a fourth level; tighten thresholds instead.
 - **The four signals.** `/readyz` probe, pod restart delta, node Ready, warning events. Adding a fifth signal is fine; removing one is a behaviour change worth justifying.
 
+## Incident state machine
+
+When an ALERT tick fires, the watcher opens an in-memory `incident` and appends every subsequent tick (ALERT/WARN/OK) until `recoveryTicks` consecutive OK ticks close it. The closing time is the *first* OK after the last non-OK tick, not the third — duration measures how long the cluster was unhealthy. A new non-OK during the recovery streak resets the counter. On program shutdown (`run()` defers `forceCloseIncident`), any open incident is written with `Closed reason: shutdown` so signal-killed sessions don't lose data.
+
+The report file is markdown with three sections — header, summary, timeline — in that order, for paste-ready use in provider support tickets. Don't reorder these sections; ticketing systems and humans both scan the header first. Keep the file extension `.md` (Linode/AWS/GitHub all render markdown in tickets).
+
 ## What's deliberately absent
 
 Don't add unless the user asks for it:

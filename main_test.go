@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -160,6 +162,146 @@ func TestScanPodsDetectsRestartDelta(t *testing.T) {
 	delta := current - prev.restarts
 	if delta != 2 {
 		t.Errorf("expected delta=2, got %d", delta)
+	}
+}
+
+func TestIncidentOpensOnAlertOnly(t *testing.T) {
+	w := &watcher{recoveryTicks: 3}
+	now := time.Now().UTC()
+
+	// WARN should not open an incident.
+	w.recordIncident(now, "WARN", "API slow 1500ms", 1500, nil, nil, nil)
+	if w.cur != nil {
+		t.Fatalf("WARN should not open an incident; got %+v", w.cur)
+	}
+	// OK should not open an incident.
+	w.recordIncident(now, "OK", "", 90, nil, nil, nil)
+	if w.cur != nil {
+		t.Fatalf("OK should not open an incident; got %+v", w.cur)
+	}
+	// First ALERT opens.
+	w.recordIncident(now, "ALERT", "readyz FAIL etcd-readiness failed", 5000, nil, nil, nil)
+	if w.cur == nil {
+		t.Fatal("ALERT should open an incident")
+	}
+	if !w.cur.startedAt.Equal(now) {
+		t.Errorf("startedAt mismatch: got %v want %v", w.cur.startedAt, now)
+	}
+	if got := len(w.cur.ticks); got != 1 {
+		t.Errorf("expected 1 tick recorded, got %d", got)
+	}
+}
+
+func TestIncidentClosesAfterRecoveryTicks(t *testing.T) {
+	dir := t.TempDir()
+	w := &watcher{recoveryTicks: 3, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	w.recordIncident(t0, "ALERT", "readyz FAIL etcd-readiness failed", 5000,
+		nil,
+		[]restartDelta{{ns: "kube-system", name: "calico-kube-controllers", delta: 1, total: 13}},
+		nil)
+	w.recordIncident(t0.Add(10*time.Second), "ALERT", "API VERY SLOW 8000ms", 8000, nil, nil, nil)
+	w.recordIncident(t0.Add(20*time.Second), "WARN", "API slow 1500ms", 1500, nil, nil, nil)
+
+	// First OK starts the recovery streak; this is what end-time should be.
+	firstOK := t0.Add(30 * time.Second)
+	w.recordIncident(firstOK, "OK", "", 90, nil, nil, nil)
+	if w.cur == nil {
+		t.Fatal("incident should still be active after 1 OK with recoveryTicks=3")
+	}
+	w.recordIncident(t0.Add(40*time.Second), "OK", "", 91, nil, nil, nil)
+	if w.cur == nil {
+		t.Fatal("incident should still be active after 2 OK")
+	}
+	w.recordIncident(t0.Add(50*time.Second), "OK", "", 92, nil, nil, nil)
+	if w.cur != nil {
+		t.Fatal("incident should have closed after 3rd OK")
+	}
+
+	files, err := filepath.Glob(filepath.Join(dir, "incident-*.md"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("expected 1 report file, got %v err=%v", files, err)
+	}
+	body, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := string(body)
+
+	// End time should be the first OK tick (t0+30s), not the third (t0+50s),
+	// since duration measures unhealthy-window.
+	wantEnd := firstOK.Format(time.RFC3339)
+	if !strings.Contains(report, "Ended (UTC):** "+wantEnd) {
+		t.Errorf("report should record end time as first OK %s; report:\n%s", wantEnd, report)
+	}
+	wantDur := "Duration:** 30s"
+	if !strings.Contains(report, wantDur) {
+		t.Errorf("report should record 30s duration; report:\n%s", report)
+	}
+	for _, want := range []string{
+		"# Cluster instability incident",
+		"Cluster context:** `test`",
+		"API server:** `https://example`",
+		"2 ALERT", "1 WARN", "3 OK",
+		"calico-kube-controllers",
+		"readyz FAIL etcd-readiness failed",
+		"API VERY SLOW 8000ms",
+		"## Timeline",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report missing %q\n--- report ---\n%s", want, report)
+		}
+	}
+}
+
+func TestIncidentNonOKResetsRecoveryStreak(t *testing.T) {
+	dir := t.TempDir()
+	w := &watcher{recoveryTicks: 3, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	w.recordIncident(t0, "ALERT", "readyz FAIL", 5000, nil, nil, nil)
+	w.recordIncident(t0.Add(10*time.Second), "OK", "", 90, nil, nil, nil)
+	w.recordIncident(t0.Add(20*time.Second), "OK", "", 91, nil, nil, nil)
+	// New ALERT mid-recovery: must reset the streak.
+	w.recordIncident(t0.Add(30*time.Second), "ALERT", "readyz FAIL again", 5000, nil, nil, nil)
+	if w.cur == nil {
+		t.Fatal("new ALERT should keep incident open")
+	}
+	if w.cur.okStreak != 0 {
+		t.Errorf("okStreak should reset to 0, got %d", w.cur.okStreak)
+	}
+	if !w.cur.firstOKAt.IsZero() {
+		t.Errorf("firstOKAt should reset, got %v", w.cur.firstOKAt)
+	}
+	// Two OKs alone are not enough to close (need 3 in a row).
+	w.recordIncident(t0.Add(40*time.Second), "OK", "", 90, nil, nil, nil)
+	w.recordIncident(t0.Add(50*time.Second), "OK", "", 90, nil, nil, nil)
+	if w.cur == nil {
+		t.Fatal("only 2 OKs after reset; should still be open")
+	}
+	w.recordIncident(t0.Add(60*time.Second), "OK", "", 90, nil, nil, nil)
+	if w.cur != nil {
+		t.Fatal("3rd OK should close incident")
+	}
+}
+
+func TestForceCloseOnShutdown(t *testing.T) {
+	dir := t.TempDir()
+	w := &watcher{recoveryTicks: 3, logDir: dir, cfgContext: "test", apiHost: "https://example"}
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	w.recordIncident(t0, "ALERT", "readyz FAIL", 5000, nil, nil, nil)
+	w.recordIncident(t0.Add(10*time.Second), "ALERT", "readyz FAIL", 5000, nil, nil, nil)
+
+	w.forceCloseIncident()
+	files, _ := filepath.Glob(filepath.Join(dir, "incident-*.md"))
+	if len(files) != 1 {
+		t.Fatalf("expected 1 report on forced close, got %v", files)
+	}
+	body, _ := os.ReadFile(files[0])
+	if !strings.Contains(string(body), "Closed reason:** shutdown") {
+		t.Errorf("expected shutdown close reason in report:\n%s", string(body))
 	}
 }
 
