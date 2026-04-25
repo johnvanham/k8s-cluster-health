@@ -130,20 +130,22 @@ Each tick line includes the context name after the timestamp so you can run mult
 When stdout is a TTY, the watcher pins a single-line status footer to the bottom of the terminal. It shows live state at a glance:
 
 ```
-ctx=my-cluster │ status=OK │ api=92ms │ pods=75/75 │ nodes=ready │ incidents=0 │ uptime=12m4s
+ctx=my-cluster │ status=OK │ api=92ms (avg 87ms) │ pods=75/75 │ nodes=ready │ incidents=0 │ uptime=12m4s
 ```
 
 During an active incident the footer changes to:
 
 ```
-ctx=my-cluster │ status=ALERT │ api=8127ms │ pods=73/75 │ nodes=ready │ INCIDENT 2m15s (14 ticks) │ incidents=2 │ uptime=1h7m
+ctx=my-cluster │ status=ALERT │ api=8127ms (avg 87ms) │ pods=73/75 │ nodes=ready │ INCIDENT 2m15s (14 ticks) │ incidents=2 │ uptime=1h7m
 ```
 
 After an incident closes:
 
 ```
-ctx=my-cluster │ status=OK │ api=92ms │ pods=75/75 │ nodes=ready │ last=14:42Z (recovered, 7m12s) │ incidents=3 │ uptime=1h14m
+ctx=my-cluster │ status=OK │ api=92ms (avg 87ms) │ pods=75/75 │ nodes=ready │ last=14:42Z (recovered, 7m12s) │ incidents=3 │ uptime=1h14m
 ```
+
+The `api=` field shows the latest tick's latency followed by `(avg <ms>)` — a session-wide arithmetic mean of every successful probe. Failed probes (HTTP non-2xx, transport errors, EOF, timeout) are deliberately excluded from the average so a flap doesn't pollute the "when it works, how fast" baseline. The average resets each time the program restarts.
 
 Implementation: the watcher sets a DECSTBM scrolling region covering rows 1..R-1 of the terminal, and re-renders the footer at row R using save/restore cursor escapes. **Log output scrolls within the upper region only — the footer stays pinned, and tmux scrollback still captures everything that scrolls out, so scrolling up to see prior history works exactly as before.** `uptime` and the live `INCIDENT <elapsed>` counter advance every second even between poll ticks.
 
@@ -213,7 +215,10 @@ The test suite covers the pure / parsing functions:
 - `TestDialAnyOneSucceeds` — a mix of unreachable + a live local listener returns `true` (first success wins).
 - `TestLocalNetUpUsesInjectedFunc` and `TestLocalNetUpDefaultsToTrueWithNoTargets` — verify the injectable hook used by tests and the safe default when no check is configured.
 - `TestTruncateVisibleNoTruncationNeeded`, `TestTruncateVisibleStripsAnsiFromCount`, `TestTruncateVisibleTruncates`, `TestTruncateVisiblePreservesAnsiButTruncatesText` — the footer's visible-width truncation handles ANSI escapes correctly (escapes don't count toward width; truncation appends a reset + ellipsis so colour doesn't bleed).
-- `TestFormatFooterShowsSeverity` — footer renders status, api, pods, nodes, incident count, uptime.
+- `TestFormatFooterShowsSeverity` — footer renders status, api (current + avg), pods, nodes, incident count, uptime.
+- `TestFormatFooterAverageOverSession` — three successful probes (100, 200, 300 ms) yield `(avg 200ms)`.
+- `TestFormatFooterAverageIgnoresFailedProbes` — a failed probe (12000 ms timeout) does NOT pollute the average.
+- `TestFormatFooterAverageShowsCurrentValueOnlyBeforeFirstSample` — before any successful probe, the footer shows the current value with no `(avg …)` suffix.
 - `TestFormatFooterShowsActiveIncident` — during an active incident, the footer shows `INCIDENT <elapsed> (N ticks)` instead of the last-incident summary.
 - `TestFormatFooterShowsLastIncident` — after closure, the footer shows `last=<HH:MMZ> (<reason>, <duration>)`.
 - `TestFormatFooterOfflineHidesPodApi` — when offline, the footer suppresses api/pods/nodes (since their values are stale).

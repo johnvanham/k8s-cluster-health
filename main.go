@@ -102,6 +102,9 @@ type footerState struct {
 	nodeSummary string
 	netState    string
 
+	apiSumMs int64 // sum of successful-probe latencies for the session average
+	apiCount int   // number of successful probes
+
 	incidentCount   int
 	lastIncidentEnd time.Time
 	lastIncidentDur time.Duration
@@ -325,7 +328,7 @@ func (w *watcher) tick(ctx context.Context) {
 					stampLabel, ctxLabel,
 					paint(ansiDim, "OFFLINE — still no local network"))
 			}
-			w.updateFooterTick("OFFLINE", rz.latency.Milliseconds(), "", "", "offline")
+			w.updateFooterTick("OFFLINE", rz.latency.Milliseconds(), "", "", "offline", false)
 			return
 		}
 	}
@@ -444,7 +447,8 @@ func (w *watcher) tick(ctx context.Context) {
 	} else if nodeErr != nil {
 		nodeSummary = "err"
 	}
-	w.updateFooterTick(severity, rz.latency.Milliseconds(), podSummary, nodeSummary, "online")
+	apiOK := rz.err == nil && rz.ok
+	w.updateFooterTick(severity, rz.latency.Milliseconds(), podSummary, nodeSummary, "online", apiOK)
 }
 
 // recordIncident drives the incident state machine.
@@ -698,14 +702,20 @@ func (w *watcher) handleResize() {
 }
 
 // updateFooterTick records the latest tick's headline state for the footer.
-// Called from each tick exit point (offline path and normal path).
-func (w *watcher) updateFooterTick(severity string, apiMs int64, podSummary, nodeSummary, netState string) {
+// apiOK indicates the API probe returned a 2xx and no transport error; only
+// those latencies count toward the session average so a flapping API doesn't
+// pollute the "when it works, how fast" metric.
+func (w *watcher) updateFooterTick(severity string, apiMs int64, podSummary, nodeSummary, netState string, apiOK bool) {
 	w.footer.mu.Lock()
 	w.footer.severity = severity
 	w.footer.apiMs = apiMs
 	w.footer.podSummary = podSummary
 	w.footer.nodeSummary = nodeSummary
 	w.footer.netState = netState
+	if apiOK {
+		w.footer.apiSumMs += apiMs
+		w.footer.apiCount++
+	}
 	w.footer.mu.Unlock()
 }
 
@@ -756,7 +766,12 @@ func (w *watcher) formatFooter() string {
 		"status=" + status,
 	}
 	if f.severity != "" && f.severity != "OFFLINE" {
-		parts = append(parts, fmt.Sprintf("api=%dms", f.apiMs))
+		if f.apiCount > 0 {
+			avg := f.apiSumMs / int64(f.apiCount)
+			parts = append(parts, fmt.Sprintf("api=%dms (avg %dms)", f.apiMs, avg))
+		} else {
+			parts = append(parts, fmt.Sprintf("api=%dms", f.apiMs))
+		}
 		if f.podSummary != "" {
 			parts = append(parts, f.podSummary)
 		}
