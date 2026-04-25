@@ -298,8 +298,9 @@ func (w *watcher) tick(ctx context.Context) {
 		prefix = paint(ansiYellow+ansiBold, "WARN ")
 	}
 
-	fmt.Printf("%s %s %s\n",
+	fmt.Printf("%s %s %s %s\n",
 		paint(ansiDim, "["+stamp+"]"),
+		paint(ansiCyan, w.cfgContext),
 		prefix,
 		strings.Join(bits, " "))
 

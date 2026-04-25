@@ -95,14 +95,16 @@ Sample header (truncated):
 ```
 k8s-cluster-health context=my-cluster server=https://kube-api.example.local:6443 interval=5s slow=1000ms alert=3000ms notify=on
 ────────────────────────────────────────────────────────────────────────────────
-[14:01:25Z] OK    api=92ms  pods=75/75 nodes=ready new-warn-evt=0
-[14:01:30Z] ALERT api=8127ms pods=73/75 nodes=ready new-warn-evt=4
+[14:01:25Z] my-cluster OK    api=92ms  pods=75/75 nodes=ready new-warn-evt=0
+[14:01:30Z] my-cluster ALERT api=8127ms pods=73/75 nodes=ready new-warn-evt=4
        └── readyz FAIL [HTTP 500] etcd-readiness failed: reason withheld
        └── restart kube-system/calico-kube-controllers-689c764695-8wbx8 +1 (now 13)
        └── event kube-system/pod/calico-kube-controllers-... [Unhealthy] Liveness probe failed: …
        └── event kube-system/pod/coredns-... [FailedCreatePodSandBox] plugin type=calico failed (add): …
-[14:01:35Z] ALERT api=ERR Get "https://kube-api.example.local:6443/readyz?verbose=1": EOF
+[14:01:35Z] my-cluster ALERT api=ERR Get "https://kube-api.example.local:6443/readyz?verbose=1": EOF
 ```
+
+Each tick line includes the context name after the timestamp so you can run multiple instances in tmux panes and see at a glance which cluster is reporting.
 
 ### What it specifically catches
 
