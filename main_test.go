@@ -501,9 +501,10 @@ func TestFormatFooterShowsSeverity(t *testing.T) {
 	for _, want := range []string{
 		"ctx=my-cluster",
 		"status=OK",
-		"api=92ms (avg 92ms)",
+		"api avg=92ms min=92ms max=92ms",
 		"pods=75/75",
 		"nodes=ready",
+		"warns=0",
 		"incidents=0",
 		"uptime=",
 	} {
@@ -513,42 +514,43 @@ func TestFormatFooterShowsSeverity(t *testing.T) {
 	}
 }
 
-func TestFormatFooterAverageOverSession(t *testing.T) {
+func TestFormatFooterShowsAvgMinMax(t *testing.T) {
 	saved := useColor
 	defer func() { useColor = saved }()
 	useColor = false
 
 	w := &watcher{cfgContext: "my-cluster", startedAt: time.Now()}
-	// 3 successful probes: 100, 200, 300 ms → avg 200.
+	// Successful probes: 100, 50, 300, 200 → avg=162, min=50, max=300.
 	w.updateFooterTick("OK", 100, "pods=10/10", "ready", "online", true)
-	w.updateFooterTick("OK", 200, "pods=10/10", "ready", "online", true)
+	w.updateFooterTick("OK", 50, "pods=10/10", "ready", "online", true)
 	w.updateFooterTick("OK", 300, "pods=10/10", "ready", "online", true)
+	w.updateFooterTick("OK", 200, "pods=10/10", "ready", "online", true)
 
 	got := w.formatFooter()
-	if !strings.Contains(got, "api=300ms (avg 200ms)") {
-		t.Errorf("expected 'api=300ms (avg 200ms)' in footer, got: %s", got)
+	if !strings.Contains(got, "api avg=162ms min=50ms max=300ms") {
+		t.Errorf("expected 'api avg=162ms min=50ms max=300ms', got: %s", got)
 	}
 }
 
-func TestFormatFooterAverageIgnoresFailedProbes(t *testing.T) {
+func TestFormatFooterAvgMinMaxIgnoresFailedProbes(t *testing.T) {
 	saved := useColor
 	defer func() { useColor = saved }()
 	useColor = false
 
 	w := &watcher{cfgContext: "my-cluster", startedAt: time.Now()}
-	// 2 successful probes (100, 200 → avg 150) and a failed one (12000) which
-	// must NOT pollute the average.
+	// Two successful (100, 200 → avg 150, min 100, max 200) plus a failed
+	// 12-second timeout that must NOT influence min/max/avg.
 	w.updateFooterTick("OK", 100, "pods=10/10", "ready", "online", true)
 	w.updateFooterTick("OK", 200, "pods=10/10", "ready", "online", true)
 	w.updateFooterTick("ALERT", 12000, "pods=10/10", "ready", "online", false)
 
 	got := w.formatFooter()
-	if !strings.Contains(got, "(avg 150ms)") {
-		t.Errorf("failed probe should be excluded from average; got: %s", got)
+	if !strings.Contains(got, "api avg=150ms min=100ms max=200ms") {
+		t.Errorf("failed probe should not affect avg/min/max; got: %s", got)
 	}
 }
 
-func TestFormatFooterAverageShowsCurrentValueOnlyBeforeFirstSample(t *testing.T) {
+func TestFormatFooterApiShowsCurrentValueOnlyBeforeFirstSample(t *testing.T) {
 	saved := useColor
 	defer func() { useColor = saved }()
 	useColor = false
@@ -561,8 +563,45 @@ func TestFormatFooterAverageShowsCurrentValueOnlyBeforeFirstSample(t *testing.T)
 	if !strings.Contains(got, "api=5000ms") {
 		t.Errorf("expected api=5000ms in footer, got: %s", got)
 	}
-	if strings.Contains(got, "(avg ") {
-		t.Errorf("expected no avg before first successful sample, got: %s", got)
+	for _, unwanted := range []string{"avg=", "min=", "max="} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("expected no %q before first successful sample, got: %s", unwanted, got)
+		}
+	}
+}
+
+func TestFormatFooterCountsWarnings(t *testing.T) {
+	saved := useColor
+	defer func() { useColor = saved }()
+	useColor = false
+
+	w := &watcher{cfgContext: "my-cluster", startedAt: time.Now()}
+	w.updateFooterTick("OK", 100, "pods=10/10", "ready", "online", true)
+	w.updateFooterTick("WARN", 1500, "pods=10/10", "ready", "online", true)
+	w.updateFooterTick("WARN", 1800, "pods=10/10", "ready", "online", true)
+	w.updateFooterTick("OK", 90, "pods=10/10", "ready", "online", true)
+	w.updateFooterTick("WARN", 1200, "pods=10/10", "ready", "online", true)
+
+	got := w.formatFooter()
+	if !strings.Contains(got, "warns=3") {
+		t.Errorf("expected warns=3 in footer, got: %s", got)
+	}
+}
+
+func TestFormatFooterWarnCountIncludesUnescalatedAlerts(t *testing.T) {
+	// ALERT ticks count as non-OK but only WARN-severity ticks count toward
+	// the "warns=" counter; this test pins that behaviour.
+	saved := useColor
+	defer func() { useColor = saved }()
+	useColor = false
+
+	w := &watcher{cfgContext: "my-cluster", startedAt: time.Now()}
+	w.updateFooterTick("ALERT", 5000, "pods=10/10", "ready", "online", false)
+	w.updateFooterTick("ALERT", 5000, "pods=10/10", "ready", "online", false)
+
+	got := w.formatFooter()
+	if !strings.Contains(got, "warns=0") {
+		t.Errorf("ALERT ticks should not increment warn counter; got: %s", got)
 	}
 }
 

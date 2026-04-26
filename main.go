@@ -102,8 +102,11 @@ type footerState struct {
 	nodeSummary string
 	netState    string
 
-	apiSumMs int64 // sum of successful-probe latencies for the session average
-	apiCount int   // number of successful probes
+	apiSumMs  int64 // sum of successful-probe latencies for the session average
+	apiCount  int   // number of successful probes
+	apiMinMs  int64 // min latency seen across successful probes
+	apiMaxMs  int64 // max latency seen across successful probes
+	warnCount int   // count of WARN-severity ticks for the session
 
 	incidentCount   int
 	lastIncidentEnd time.Time
@@ -713,8 +716,22 @@ func (w *watcher) updateFooterTick(severity string, apiMs int64, podSummary, nod
 	w.footer.nodeSummary = nodeSummary
 	w.footer.netState = netState
 	if apiOK {
+		if w.footer.apiCount == 0 {
+			w.footer.apiMinMs = apiMs
+			w.footer.apiMaxMs = apiMs
+		} else {
+			if apiMs < w.footer.apiMinMs {
+				w.footer.apiMinMs = apiMs
+			}
+			if apiMs > w.footer.apiMaxMs {
+				w.footer.apiMaxMs = apiMs
+			}
+		}
 		w.footer.apiSumMs += apiMs
 		w.footer.apiCount++
+	}
+	if severity == "WARN" {
+		w.footer.warnCount++
 	}
 	w.footer.mu.Unlock()
 }
@@ -768,7 +785,8 @@ func (w *watcher) formatFooter() string {
 	if f.severity != "" && f.severity != "OFFLINE" {
 		if f.apiCount > 0 {
 			avg := f.apiSumMs / int64(f.apiCount)
-			parts = append(parts, fmt.Sprintf("api=%dms (avg %dms)", f.apiMs, avg))
+			parts = append(parts, fmt.Sprintf("api avg=%dms min=%dms max=%dms",
+				avg, f.apiMinMs, f.apiMaxMs))
 		} else {
 			parts = append(parts, fmt.Sprintf("api=%dms", f.apiMs))
 		}
@@ -789,6 +807,7 @@ func (w *watcher) formatFooter() string {
 			f.lastIncidentRsn,
 			f.lastIncidentDur))
 	}
+	parts = append(parts, fmt.Sprintf("warns=%d", f.warnCount))
 	parts = append(parts, fmt.Sprintf("incidents=%d", f.incidentCount))
 	parts = append(parts, "uptime="+uptime.String())
 
