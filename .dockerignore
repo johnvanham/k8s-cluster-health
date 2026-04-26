@@ -1,0 +1,8 @@
+.git
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+CLAUDE.md
+k8s-cluster-health
+incident-*.md

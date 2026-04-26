@@ -4,16 +4,19 @@ Guidance for AI-assisted edits to this repository.
 
 ## What this project is
 
-A single-binary, terminal-first Go tool that watches a Kubernetes cluster and alerts (stdout + terminal bell + GNOME `notify-send`) when control-plane or workload instability is detected. Originally written to surface LKE managed-control-plane flaps in real time.
+A single-binary, terminal-first Go tool that watches a Kubernetes cluster and alerts (stdout + terminal bell + GNOME `notify-send` + optional SMTP2GO email) when control-plane or workload instability is detected. Originally written to surface LKE managed-control-plane flaps in real time.
 
-It is a **diagnostic tool**, not a controller, not an operator, not a service. No leader election, no persistence, no HA. Polls on a timer; one process, one cluster.
+It is a **diagnostic tool**, not a controller, not an operator, not a service. No leader election, no HA. Polls on a timer; one process, one cluster. The single piece of persisted state is the per-context "last incident" record — purely cosmetic, lets the footer survive restarts.
 
 ## Project shape
 
-- `main.go` — the entire program (intentionally single-file).
+- `main.go` — main loop, watcher, tick logic, footer, incident state machine.
+- `state.go` — per-context state file (`<state-dir>/<context>.json`).
+- `email.go` — SMTP2GO email integration + plain-text incident body renderer.
 - `main_test.go` — unit tests for pure functions (parsing, formatting, helpers).
-- `go.mod` / `go.sum` — minimal direct deps (`k8s.io/api`, `k8s.io/apimachinery`, `k8s.io/client-go`).
-- No `internal/`, `pkg/`, `cmd/` — keep it flat. If `main.go` grows past ~500 lines, split by concern into sibling files in the same `package main`, not into subpackages.
+- `Dockerfile` / `.dockerignore` — multi-stage build to a distroless static image.
+- `go.mod` / `go.sum` — minimal direct deps (`k8s.io/api`, `k8s.io/apimachinery`, `k8s.io/client-go`, `golang.org/x/term`).
+- No `internal/`, `pkg/`, `cmd/` — keep it flat. New concerns go in sibling files in the same `package main`, not into subpackages.
 
 ## Build / test commands
 
@@ -68,12 +71,38 @@ Don't get clever about diagnosing the *cause* of the local outage (DNS vs. TCP v
 
 The injectable `netCheckFunc` field on `watcher` is purely for tests. Don't repurpose it as a runtime override; flags are the user-facing surface.
 
+## State file (per-context "last incident")
+
+`<state-dir>/<context>.json` records `last_incident_end`, `last_incident_duration`, `last_incident_reason`, and a cumulative `incident_count`. Loaded at startup, written atomically (`tmp` + `rename`) on incident close. Purely cosmetic — drives the footer's `last=YYYY-MM-DD HH:MMZ (reason, duration)` field across restarts. The on-disk markdown reports in `-log-dir` remain the source of truth for incident detail.
+
+Default `<state-dir>` is `$XDG_STATE_HOME/k8s-cluster-health` (fallback `~/.local/state/k8s-cluster-health`); `-state-dir` overrides. Context names are sanitised to `[A-Za-z0-9._-]+` for filesystem safety (kubeconfig contexts often contain `:` or `/` — LKE/EKS/GKE all do).
+
+If state-dir resolution or load fails, the watcher logs a `warn:` to stderr and continues with empty state — never fatal. Don't add a fallback to a different location; one path, one obvious failure mode.
+
+## SMTP2GO email integration
+
+Configured by `-email-to` (comma-separated), `-email-from`, and `SMTP2GO_API_KEY` env. All three must be set or `newEmailer` returns `nil` and email is silently disabled.
+
+Sends fire on incident **open** and incident **close** (matching `notify-send` cadence — never per-tick). The body is a plain-text dump of header + tick timeline (`buildIncidentEmailBody`); on close it also includes the path to the markdown report. Subject is `[k8s-cluster-health] <context> ALERT|RECOVERED|SHUTDOWN`.
+
+Sends are launched in goroutines tracked via `watcher.bgWG`; `forceCloseIncident` waits on the WaitGroup so the shutdown-time email actually leaves the process before `main` returns. Failures (HTTP non-2xx or transport error) print `ERR email send failed: …` to stderr and don't block subsequent ticks.
+
+The credential is in env, not a flag, so it doesn't appear in `ps` output or shell history.
+
+## Container packaging
+
+`Dockerfile` is multi-stage: `golang:alpine` builder → `gcr.io/distroless/static-debian12`. The binary is fully static (`CGO_ENABLED=0`). Default entrypoint passes `-log-dir /tmp -state-dir /state` so the only volume the user has to think about is the state directory if they want it to persist across restarts.
+
+`inContainer()` detects `/.dockerenv` (Docker) or `/run/.containerenv` (Podman) and auto-disables bell + `notify-send` so the entrypoint is friendly without extra flags. `-no-container-detect` opts out (e.g., for forwarded DBus sessions).
+
+The image runs as root by default. Distroless `:nonroot` would be marginally better, but stock kubeconfig files (`0600`, owned by user) wouldn't be readable by uid 65532 without a chown step on the host, and that friction isn't worth it for a diagnostic tool.
+
 ## What's deliberately absent
 
 Don't add unless the user asks for it:
 
-- Slack / Pushover / PagerDuty / webhook integrations (the brief is "alert on screen").
-- Persistence, history files, log rotation.
+- Slack / Pushover / PagerDuty / webhook integrations beyond the existing SMTP2GO path.
+- History files, log rotation, structured JSON output, or persistence beyond the single per-context state file described above.
 - Configuration files (the flag set is small enough; no need for YAML / TOML).
 - Watch-based reconciliation; polling is the model.
 - Subpackages or interfaces; the program is small enough that abstraction adds only cost.
@@ -85,9 +114,11 @@ Defaults (`slow=1000ms`, `alert=3000ms`) are calibrated to a managed control pla
 
 ## When you change the alert rendering
 
-- Update `TestBuildNotifyBody` / `TestBuildNotifyBodyTruncatesLargeLists` if you change the body format.
+- Update `TestBuildNotifyBody` / `TestBuildNotifyBodyTruncatesLargeLists` if you change the desktop-notification body format.
+- Update `TestBuildIncidentEmailBodyOpen` / `TestBuildIncidentEmailBodyClose` if you change the email body format.
 - The `…and N more` truncation pattern matters; the GNOME tray clips long bodies and we want the user to see we suppressed entries.
 - Critical urgency makes notifications persist in GNOME's tray until dismissed. Don't downgrade `ALERT` to `normal` urgency without saying why.
+- Keep the email body plain text. SMTP2GO supports HTML, but plain text renders consistently in every client and is what a paste-into-ticket workflow expects.
 
 ## When you change the API probe
 

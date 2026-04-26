@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,9 +127,9 @@ func TestBuildNotifyBodyEmpty(t *testing.T) {
 func TestLastSeen(t *testing.T) {
 	now := time.Now().UTC()
 	e := &corev1.Event{
-		LastTimestamp:     metav1.Time{Time: now},
-		EventTime:         metav1.MicroTime{Time: now.Add(-time.Hour)},
-		ObjectMeta:        metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-2 * time.Hour)}},
+		LastTimestamp: metav1.Time{Time: now},
+		EventTime:     metav1.MicroTime{Time: now.Add(-time.Hour)},
+		ObjectMeta:    metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-2 * time.Hour)}},
 	}
 	if got := lastSeen(e); !got.Equal(now) {
 		t.Errorf("lastSeen() preferred wrong field: got %v want %v", got, now)
@@ -149,8 +153,8 @@ func TestLastSeen(t *testing.T) {
 
 func TestScanPodsDetectsRestartDelta(t *testing.T) {
 	w := &watcher{
-		pods:       map[podKey]podSnap{{ns: "default", name: "p"}: {restarts: 5}},
-		seenEvents: make(map[string]time.Time),
+		pods:        map[podKey]podSnap{{ns: "default", name: "p"}: {restarts: 5}},
+		seenEvents:  make(map[string]time.Time),
 		initialized: true,
 	}
 	// Mimic what scanPods does internally for a single pod:
@@ -643,7 +647,7 @@ func TestFormatFooterShowsLastIncident(t *testing.T) {
 
 	got := w.formatFooter()
 	for _, want := range []string{
-		"last=14:30Z",
+		"last=2026-04-25 14:30Z",
 		"recovered",
 		"7m0s",
 		"incidents=3",
@@ -671,6 +675,279 @@ func TestFormatFooterOfflineHidesPodApi(t *testing.T) {
 		if strings.Contains(got, unwanted) {
 			t.Errorf("offline footer should hide %q, got: %s", unwanted, got)
 		}
+	}
+}
+
+func TestSanitizeContextName(t *testing.T) {
+	cases := map[string]string{
+		"my-cluster":       "my-cluster",
+		"lke12345-prod":    "lke12345-prod",
+		"arn:aws:eks:..":   "arn_aws_eks_..",
+		"gke_proj_us_x":    "gke_proj_us_x",
+		"weird/name space": "weird_name_space",
+		"":                 "default",
+	}
+	for in, want := range cases {
+		if got := sanitizeContextName(in); got != want {
+			t.Errorf("sanitizeContextName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestResolveStateDirOverride(t *testing.T) {
+	got, err := resolveStateDir("/tmp/explicit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/tmp/explicit" {
+		t.Errorf("explicit override should win, got %q", got)
+	}
+}
+
+func TestResolveStateDirXDG(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "/var/state")
+	got, err := resolveStateDir("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/var/state/k8s-cluster-health" {
+		t.Errorf("expected XDG-based path, got %q", got)
+	}
+}
+
+func TestStateFileRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := stateFilePath(dir, "lke:prod-1")
+	if !strings.Contains(path, "lke_prod-1.json") {
+		t.Errorf("expected sanitized filename, got %q", path)
+	}
+
+	// Loading a missing file returns an empty struct, not an error.
+	s, err := loadState(path)
+	if err != nil {
+		t.Fatalf("loadState on missing file should not error: %v", err)
+	}
+	if s.IncidentCount != 0 {
+		t.Errorf("missing file should yield zero state, got %+v", s)
+	}
+
+	endedAt := time.Date(2026, 4, 25, 14, 30, 0, 0, time.UTC)
+	in := &persistentState{
+		Context:            "lke:prod-1",
+		LastIncidentEnd:    endedAt,
+		LastIncidentDur:    "7m15s",
+		LastIncidentReason: "recovered",
+		IncidentCount:      4,
+	}
+	if err := saveState(path, in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Context != in.Context ||
+		!out.LastIncidentEnd.Equal(in.LastIncidentEnd) ||
+		out.LastIncidentDur != in.LastIncidentDur ||
+		out.LastIncidentReason != in.LastIncidentReason ||
+		out.IncidentCount != in.IncidentCount {
+		t.Errorf("round-trip mismatch:\n got %+v\nwant %+v", out, in)
+	}
+}
+
+func TestParseCSV(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"a@x.com", []string{"a@x.com"}},
+		{"a@x.com, b@y.com  ,c@z.com", []string{"a@x.com", "b@y.com", "c@z.com"}},
+		{"  ,  ,  ", nil},
+	}
+	for _, tc := range cases {
+		got := parseCSV(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("parseCSV(%q) len=%d, want %d (%v vs %v)", tc.in, len(got), len(tc.want), got, tc.want)
+			continue
+		}
+		for i, v := range tc.want {
+			if got[i] != v {
+				t.Errorf("parseCSV(%q)[%d] = %q, want %q", tc.in, i, got[i], v)
+			}
+		}
+	}
+}
+
+func TestEmailerNilWhenMisconfigured(t *testing.T) {
+	t.Setenv("SMTP2GO_API_KEY", "")
+	if e := newEmailer("from@example.com", []string{"to@example.com"}); e != nil {
+		t.Error("missing API key should yield nil emailer")
+	}
+	t.Setenv("SMTP2GO_API_KEY", "key")
+	if e := newEmailer("", []string{"to@example.com"}); e != nil {
+		t.Error("missing from should yield nil emailer")
+	}
+	if e := newEmailer("from@example.com", nil); e != nil {
+		t.Error("missing recipients should yield nil emailer")
+	}
+}
+
+func TestEmailerSendsExpectedRequest(t *testing.T) {
+	t.Setenv("SMTP2GO_API_KEY", "test-api-key")
+
+	var captured smtp2goRequest
+	var capturedContentType string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedContentType = r.Header.Get("Content-Type")
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &captured); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":{"succeeded":1}}`))
+	}))
+	defer ts.Close()
+
+	e := newEmailer("alerts@example.com", []string{"a@x.com", "b@y.com"})
+	if e == nil {
+		t.Fatal("newEmailer returned nil despite valid config")
+	}
+	e.endpoint = ts.URL
+
+	if err := e.send("subj", "body text"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if capturedContentType != "application/json" {
+		t.Errorf("expected JSON content-type, got %q", capturedContentType)
+	}
+	if captured.APIKey != "test-api-key" {
+		t.Errorf("api_key: got %q", captured.APIKey)
+	}
+	if captured.Sender != "alerts@example.com" {
+		t.Errorf("sender: got %q", captured.Sender)
+	}
+	if len(captured.To) != 2 || captured.To[0] != "a@x.com" || captured.To[1] != "b@y.com" {
+		t.Errorf("to: got %v", captured.To)
+	}
+	if captured.Subject != "subj" || captured.TextBody != "body text" {
+		t.Errorf("subject/body mismatch: %+v", captured)
+	}
+}
+
+func TestEmailerSendNon2xxReturnsError(t *testing.T) {
+	t.Setenv("SMTP2GO_API_KEY", "test-api-key")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"data":{"error":"invalid api key"}}`))
+	}))
+	defer ts.Close()
+
+	e := newEmailer("from@example.com", []string{"to@example.com"})
+	if e == nil {
+		t.Fatal("newEmailer returned nil")
+	}
+	e.endpoint = ts.URL
+
+	err := e.send("s", "b")
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Errorf("expected 401 error, got %v", err)
+	}
+}
+
+func TestBuildIncidentEmailBodyOpen(t *testing.T) {
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	inc := &incident{
+		startedAt: t0,
+		ticks: []incidentTick{
+			{when: t0, severity: "ALERT", apiLatencyMs: 5000, apiAlert: "readyz FAIL"},
+		},
+	}
+	body := buildIncidentEmailBody("my-cluster", "https://api.example", "open", inc, "")
+	for _, want := range []string{
+		"Cluster:    my-cluster",
+		"API server: https://api.example",
+		"Started:    2026-04-25T12:00:00Z",
+		"Ended:      (still active)",
+		"Timeline:",
+		"12:00:00Z ALERT api=5000ms",
+		"readyz FAIL",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("open email body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "Report:") {
+		t.Errorf("open email body should not contain Report: line, got:\n%s", body)
+	}
+}
+
+func TestBuildIncidentEmailBodyClose(t *testing.T) {
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	inc := &incident{
+		startedAt: t0,
+		endedAt:   t0.Add(7 * time.Minute),
+		ticks: []incidentTick{
+			{when: t0, severity: "ALERT", apiLatencyMs: 5000, apiAlert: "readyz FAIL"},
+			{when: t0.Add(7 * time.Minute), severity: "OK", apiLatencyMs: 92},
+		},
+	}
+	body := buildIncidentEmailBody("my-cluster", "https://api.example", "recovered", inc,
+		"/var/log/incident-2026-04-25T12-00-00Z.md")
+	for _, want := range []string{
+		"Started:    2026-04-25T12:00:00Z",
+		"Ended:      2026-04-25T12:07:00Z",
+		"Duration:   7m0s",
+		"Closed:     recovered",
+		"Report:     /var/log/incident-2026-04-25T12-00-00Z.md",
+		"OK    api=92ms",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("close email body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+func TestCloseIncidentWritesStateFile(t *testing.T) {
+	saved := useColor
+	defer func() { useColor = saved }()
+	useColor = false
+
+	dir := t.TempDir()
+	stateDir := t.TempDir()
+	w := &watcher{
+		recoveryTicks:    1,
+		minConfirmations: 1,
+		logDir:           dir,
+		cfgContext:       "lke:prod",
+		apiHost:          "https://example",
+		stateFile:        stateFilePath(stateDir, "lke:prod"),
+	}
+	t0 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+
+	w.recordIncident(t0, "ALERT", "boom", 5000, nil, nil, nil)
+	w.recordIncident(t0.Add(10*time.Second), "OK", "", 90, nil, nil, nil)
+	if w.cur != nil {
+		t.Fatal("incident should have closed")
+	}
+
+	loaded, err := loadState(w.stateFile)
+	if err != nil {
+		t.Fatalf("loadState after close: %v", err)
+	}
+	if loaded.IncidentCount != 1 {
+		t.Errorf("IncidentCount: got %d, want 1", loaded.IncidentCount)
+	}
+	if loaded.LastIncidentReason != "recovered" {
+		t.Errorf("LastIncidentReason: got %q, want recovered", loaded.LastIncidentReason)
+	}
+	if loaded.LastIncidentDur == "" {
+		t.Errorf("LastIncidentDur should be non-empty, got %q", loaded.LastIncidentDur)
+	}
+	// End time matches the first OK after the last non-OK (i.e., t0+10s).
+	wantEnd := t0.Add(10 * time.Second)
+	if !loaded.LastIncidentEnd.Equal(wantEnd) {
+		t.Errorf("LastIncidentEnd: got %v, want %v", loaded.LastIncidentEnd, wantEnd)
 	}
 }
 

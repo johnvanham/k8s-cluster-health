@@ -1,6 +1,6 @@
 # k8s-cluster-health
 
-Single-binary Kubernetes cluster health watcher. Polls the API server, pods, nodes, and warning events on an interval, prints a colourised status line per tick, and raises terminal + GNOME desktop notifications when instability is detected.
+Single-binary Kubernetes cluster health watcher. Polls the API server, pods, nodes, and warning events on an interval, prints a colourised status line per tick, and raises terminal + GNOME desktop notifications + optional SMTP2GO email when instability is detected.
 
 Built originally to spot LKE (Linode Kubernetes Engine) managed-control-plane flaps in real time — `etcd-readiness failed`, slow `/readyz` responses, and the cascading restart loops they cause across `calico-kube-controllers`, `csi-*`, `cert-manager`, `kube-state-metrics`, etc.
 
@@ -45,6 +45,17 @@ Requires Go 1.25+. The binary is ~50 MB (statically links `client-go`).
 | `-net-check-targets` | `1.1.1.1:443,8.8.8.8:443` | Comma-separated TCP targets used to detect local connectivity loss; first success wins |
 | `-no-net-check` | off | Disable local-network detection (every API failure becomes a cluster issue) |
 | `-no-footer` | off | Disable the sticky status footer |
+| `-state-dir` | `$XDG_STATE_HOME/k8s-cluster-health` (or `~/.local/state/...`) | Directory for per-context state files (`<context>.json`) |
+| `-email-to` | unset | Comma-separated recipients for SMTP2GO email alerts (requires `SMTP2GO_API_KEY` env + `-email-from`) |
+| `-email-from` | unset | Sender address for SMTP2GO email alerts |
+| `-no-container-detect` | off | Skip auto-disabling `-no-bell` / `-no-notify` when running inside a container |
+
+Environment variables:
+
+| Var | Purpose |
+|---|---|
+| `SMTP2GO_API_KEY` | API key for SMTP2GO. Email alerts are silently disabled when unset. Kept out of flags so it doesn't show up in `ps` or shell history. |
+| `XDG_STATE_HOME` | Standard XDG location used as the default state directory parent. |
 
 ## How it works
 
@@ -112,7 +123,7 @@ Sample header (truncated):
 ### Sample output
 
 ```
-k8s-cluster-health context=my-cluster server=https://kube-api.example.local:6443 interval=5s slow=1000ms alert=3000ms notify=on
+k8s-cluster-health context=my-cluster server=https://kube-api.example.local:6443 interval=5s slow=1000ms alert=3000ms confirm=2 recover=3 notify=on net-check=1.1.1.1:443,8.8.8.8:443 email=off state=/home/me/.local/state/k8s-cluster-health/my-cluster.json
 ────────────────────────────────────────────────────────────────────────────────
 [14:01:25Z] my-cluster OK    api=92ms  pods=75/75 nodes=ready new-warn-evt=0
 [14:01:30Z] my-cluster ALERT api=8127ms pods=73/75 nodes=ready new-warn-evt=4
@@ -142,8 +153,10 @@ ctx=my-cluster │ status=ALERT │ api avg=120ms min=14ms max=8127ms │ pods=7
 After an incident closes:
 
 ```
-ctx=my-cluster │ status=OK │ api avg=92ms min=14ms max=521ms │ pods=75/75 │ nodes=ready │ last=14:42Z (recovered, 7m12s) │ warns=8 │ incidents=3 │ uptime=1h14m
+ctx=my-cluster │ status=OK │ api avg=92ms min=14ms max=521ms │ pods=75/75 │ nodes=ready │ last=2026-04-25 14:42Z (recovered, 7m12s) │ warns=8 │ incidents=3 │ uptime=1h14m
 ```
+
+The `last=…` field shows full date + time so the user can see at a glance whether the most-recent incident was today or weeks ago. It is loaded from the per-context state file at startup, so it survives restarts of the watcher.
 
 The `api` field shows session-wide statistics for successful API probes: arithmetic mean (`avg`), minimum (`min`), and maximum (`max`) latency in milliseconds. Failed probes (HTTP non-2xx, transport errors, EOF, timeout) are deliberately excluded so a flap doesn't pollute the baseline. Before the first successful sample, the field collapses to `api=<latest>ms`. All counters reset each time the program restarts.
 
@@ -165,6 +178,77 @@ When the local network comes back, a one-line `ONLINE — local network restored
 
 Pass `-no-net-check` to disable this entirely (every API failure is then treated as a real cluster issue, like before).
 
+### Persistent state file
+
+The watcher records the most-recent incident per kubeconfig context to `<state-dir>/<context>.json`:
+
+```json
+{
+  "context": "lke12345-prod",
+  "last_incident_end": "2026-04-25T14:42:11Z",
+  "last_incident_duration": "7m12s",
+  "last_incident_reason": "recovered",
+  "incident_count": 3
+}
+```
+
+Default location: `$XDG_STATE_HOME/k8s-cluster-health` (or `~/.local/state/k8s-cluster-health` if `XDG_STATE_HOME` is unset). Override with `-state-dir`.
+
+The file is written atomically (`tmp` + rename) at incident close, and loaded at startup so the footer's `last=…` field survives restarts. The cumulative `incident_count` survives too. Context names are sanitised to `[A-Za-z0-9._-]+` for filesystem safety, since LKE / EKS / GKE contexts often contain `:` or `/`.
+
+The full markdown incident reports written to `-log-dir` remain the authoritative record — the state file is just a tiny "what was the last bad thing" pointer for the footer.
+
+### Email alerts via SMTP2GO
+
+Set three things and email alerts are sent on incident open and close:
+
+```sh
+export SMTP2GO_API_KEY=api-...
+./k8s-cluster-health \
+    -context my-cluster \
+    -email-from alerts@example.com \
+    -email-to oncall@example.com,backup-oncall@example.com
+```
+
+The startup banner shows `email=on(2)` or `email=off` so you can tell at a glance whether it's wired up.
+
+- **Cadence.** Open + close (matching `notify-send`); never per-tick.
+- **Subject.** `[k8s-cluster-health] <context> ALERT` on open, `[k8s-cluster-health] <context> RECOVERED` on close, `[k8s-cluster-health] <context> SHUTDOWN` if the program is killed mid-incident.
+- **Body.** Plain text — header (cluster, API server, start, end, duration, close reason, report path) followed by a per-tick timeline. Same content as the markdown report but flat-text so any client renders it the same.
+- **Failures** (HTTP non-2xx, transport error) print a one-line `ERR email send failed: …` to stderr and don't block the poll loop.
+- **Shutdown.** A signal-killed session waits for any in-flight email send to complete (up to the SMTP2GO HTTP timeout) before exiting, so the shutdown alert actually leaves the process.
+
+The API key is read from the environment specifically so it doesn't show up in `ps` output or shell history. There's no flag for it.
+
+### Running in a container
+
+A multi-stage `Dockerfile` builds a fully-static binary on top of `gcr.io/distroless/static-debian12`:
+
+```sh
+docker build -t k8s-cluster-health .
+```
+
+Sample run:
+
+```sh
+docker run --rm -it \
+  -v "$HOME/.kube:/root/.kube:ro" \
+  -v "k8s-cluster-health-state:/state" \
+  -e SMTP2GO_API_KEY \
+  k8s-cluster-health \
+    -context my-cluster \
+    -interval 5s \
+    -email-from alerts@example.com \
+    -email-to oncall@example.com
+```
+
+Notes:
+
+- **Kubeconfig.** Mount `~/.kube` (or `$KUBECONFIG`) read-only into `/root/.kube` so the existing default-discovery logic finds it. For an in-cluster pod use a `ServiceAccount` and skip the mount — `client-go` auto-detects in-cluster config.
+- **State.** The default entrypoint passes `-log-dir /tmp -state-dir /state`. Mount a named volume at `/state` to keep the per-context "last incident" record across container restarts; `/tmp` for incident reports.
+- **Bell + notify-send** are auto-disabled when `/.dockerenv` (or `/run/.containerenv`) is detected — pass `-no-container-detect` if you have a forwarded DBus session and actually want desktop notifications from a container.
+- **Footer** auto-disables when stdout isn't a TTY; if you want the footer when running interactively, use `-it` and a terminal that's at least 30×6.
+
 ### What it specifically catches
 
 | Signal | Surfaced as |
@@ -179,9 +263,9 @@ Pass `-no-net-check` to disable this entirely (every API failure is then treated
 
 ### What it deliberately does not do
 
-- No persistent state; restart counters and the seen-event set live only in memory. Restart this tool and you re-baseline.
+- The runtime working set (restart counters, seen-event set, pending tick buffer) lives only in memory; restart this tool and the watcher re-baselines. The single piece of persisted state is the per-context "last incident" record (cosmetic, footer-only).
 - No history / log file; output is append-only on stdout. Pipe it through `tee` if you want a transcript.
-- No alerting beyond stdout, terminal bell, and `notify-send`. No Slack, no Pushover, no PagerDuty integrations.
+- No alerting beyond stdout, terminal bell, `notify-send`, and SMTP2GO email. No Slack, no Pushover, no PagerDuty integrations.
 - No CRD / CR-specific health checks — only core API objects (pods, nodes, events) plus `/readyz`.
 - No leader election or distributed coordination — this is a single-process diagnostic, not a controller.
 
@@ -224,7 +308,16 @@ The test suite covers the pure / parsing functions:
 - `TestFormatFooterCountsWarnings` — every WARN-severity tick increments `warns=`.
 - `TestFormatFooterWarnCountIncludesUnescalatedAlerts` — pins that ALERT ticks do *not* increment the warn counter (only WARN does).
 - `TestFormatFooterShowsActiveIncident` — during an active incident, the footer shows `INCIDENT <elapsed> (N ticks)` instead of the last-incident summary.
-- `TestFormatFooterShowsLastIncident` — after closure, the footer shows `last=<HH:MMZ> (<reason>, <duration>)`.
+- `TestFormatFooterShowsLastIncident` — after closure, the footer shows `last=<YYYY-MM-DD HH:MMZ> (<reason>, <duration>)`.
+- `TestSanitizeContextName` — kubeconfig context names are mapped to safe filenames (`:` and `/` become `_`).
+- `TestResolveStateDirOverride` / `TestResolveStateDirXDG` — `-state-dir` wins; otherwise `XDG_STATE_HOME` is used.
+- `TestStateFileRoundTrip` — `saveState` + `loadState` round-trips a full record; missing file yields zero-value state, not an error.
+- `TestParseCSV` — comma-separated parser used by `-email-to` (trims, drops empties).
+- `TestEmailerNilWhenMisconfigured` — missing `SMTP2GO_API_KEY`, missing `-email-from`, or empty recipient list yields `nil` (silent disable).
+- `TestEmailerSendsExpectedRequest` — uses `httptest.Server` to verify the JSON body, content-type, recipients, sender, and subject sent to SMTP2GO.
+- `TestEmailerSendNon2xxReturnsError` — HTTP 401 from SMTP2GO surfaces as an error.
+- `TestBuildIncidentEmailBodyOpen` / `TestBuildIncidentEmailBodyClose` — plain-text email body renders header + timeline correctly for both open (no end time, no report path) and close (full bookkeeping).
+- `TestCloseIncidentWritesStateFile` — after an incident closes, the per-context JSON state file is written with the correct count, reason, and end time.
 - `TestFormatFooterOfflineHidesPodApi` — when offline, the footer suppresses api/pods/nodes (since their values are stale).
 
 The Kubernetes API client itself is not mocked; the live-cluster paths (`scanPods`, `scanNodes`, `scanEvents`, `probeReadyz`) are exercised via the smoke run described below.
@@ -257,7 +350,10 @@ Within one or two ticks you should see a `restart` line and a GNOME notification
 
 ## Files
 
-- `main.go` — the watcher (single file).
+- `main.go` — main loop, watcher, footer, incident state machine.
+- `state.go` — per-context state file (`<state-dir>/<context>.json`) load/save.
+- `email.go` — SMTP2GO email integration + plain-text incident body renderer.
 - `main_test.go` — unit tests for pure functions.
+- `Dockerfile` / `.dockerignore` — multi-stage build to a distroless static image.
 - `go.mod` / `go.sum` — pinned to `k8s.io/client-go v0.31.4`.
 - `CLAUDE.md` — guidance for AI-assisted edits to this repo.

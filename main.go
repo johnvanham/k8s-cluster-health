@@ -27,12 +27,12 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"golang.org/x/term"
 )
 
 const (
@@ -144,9 +144,9 @@ type watcher struct {
 	netCheckFunc    func() bool // injectable for tests; nil falls back to dialAny
 	localOnline     bool
 
-	footer    footerState
-	noFooter  bool
-	resizeCh  chan struct{}
+	footer   footerState
+	noFooter bool
+	resizeCh chan struct{}
 
 	pods        map[podKey]podSnap
 	initialized bool
@@ -155,23 +155,31 @@ type watcher struct {
 
 	startedAt time.Time
 	alertN    int
+
+	stateFile string
+	email     *emailer
+	bgWG      sync.WaitGroup // tracks fire-and-forget email sends so shutdown can flush
 }
 
 func main() {
 	var (
-		kubeconfig       string
-		kubectx          string
-		interval         time.Duration
-		slowMs           int64
-		alertMs          int64
-		silent           bool
-		noNotify         bool
-		logDir           string
-		recoveryTicks    int
-		minConfirmations int
-		netTargetsCSV    string
-		noNetCheck       bool
-		noFooter         bool
+		kubeconfig        string
+		kubectx           string
+		interval          time.Duration
+		slowMs            int64
+		alertMs           int64
+		silent            bool
+		noNotify          bool
+		logDir            string
+		recoveryTicks     int
+		minConfirmations  int
+		netTargetsCSV     string
+		noNetCheck        bool
+		noFooter          bool
+		stateDir          string
+		emailToCSV        string
+		emailFrom         string
+		noContainerDetect bool
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (default: $KUBECONFIG or ~/.kube/config).")
@@ -187,7 +195,20 @@ func main() {
 	flag.StringVar(&netTargetsCSV, "net-check-targets", "1.1.1.1:443,8.8.8.8:443", "Comma-separated TCP targets used to detect local connectivity loss; first success wins.")
 	flag.BoolVar(&noNetCheck, "no-net-check", false, "Disable local-network detection (every API failure becomes a cluster issue).")
 	flag.BoolVar(&noFooter, "no-footer", false, "Disable the sticky status footer.")
+	flag.StringVar(&stateDir, "state-dir", "", "Directory for per-context state files (default: $XDG_STATE_HOME/k8s-cluster-health, fallback ~/.local/state/k8s-cluster-health).")
+	flag.StringVar(&emailToCSV, "email-to", "", "Comma-separated recipients for SMTP2GO email alerts. Requires SMTP2GO_API_KEY env and -email-from.")
+	flag.StringVar(&emailFrom, "email-from", "", "Sender address for SMTP2GO email alerts.")
+	flag.BoolVar(&noContainerDetect, "no-container-detect", false, "Skip auto-disabling -no-bell / -no-notify when running inside a container.")
 	flag.Parse()
+
+	// Auto-disable bell + notify-send when running in a container; they're
+	// useless without a desktop session and just spam stderr otherwise.
+	// -no-container-detect lets users opt out (e.g., a container that does
+	// have a DBus session forwarded in).
+	if !noContainerDetect && inContainer() {
+		silent = true
+		noNotify = true
+	}
 
 	if recoveryTicks < 1 {
 		recoveryTicks = 1
@@ -225,6 +246,24 @@ func main() {
 		}
 	}
 
+	resolvedStateDir, err := resolveStateDir(stateDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: resolving state dir: %v (state persistence disabled)\n", err)
+	}
+	var sf string
+	loaded := &persistentState{}
+	if resolvedStateDir != "" {
+		sf = stateFilePath(resolvedStateDir, ctxName)
+		ls, err := loadState(sf)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: loading state file %s: %v\n", sf, err)
+		} else {
+			loaded = ls
+		}
+	}
+
+	em := newEmailer(emailFrom, parseCSV(emailToCSV))
+
 	w := &watcher{
 		cs:               cs,
 		httpClient:       hc,
@@ -246,7 +285,17 @@ func main() {
 		seenEvents:       make(map[string]time.Time),
 		prevNotRdy:       make(map[string]bool),
 		startedAt:        time.Now().UTC(),
+		stateFile:        sf,
+		email:            em,
 	}
+	w.footer.incidentCount = loaded.IncidentCount
+	w.footer.lastIncidentEnd = loaded.LastIncidentEnd
+	if loaded.LastIncidentDur != "" {
+		if d, perr := time.ParseDuration(loaded.LastIncidentDur); perr == nil {
+			w.footer.lastIncidentDur = d
+		}
+	}
+	w.footer.lastIncidentRsn = loaded.LastIncidentReason
 
 	notifyState := "off"
 	switch {
@@ -261,11 +310,19 @@ func main() {
 	if len(netTargets) > 0 {
 		netCheckState = strings.Join(netTargets, ",")
 	}
-	fmt.Printf("%s context=%s server=%s interval=%s slow=%dms alert=%dms confirm=%d recover=%d notify=%s net-check=%s\n",
+	emailState := "off"
+	if em != nil {
+		emailState = fmt.Sprintf("on(%d)", len(em.to))
+	}
+	stateFileState := "off"
+	if sf != "" {
+		stateFileState = sf
+	}
+	fmt.Printf("%s context=%s server=%s interval=%s slow=%dms alert=%dms confirm=%d recover=%d notify=%s net-check=%s email=%s state=%s\n",
 		paint(ansiBold, "k8s-cluster-health"),
 		paint(ansiCyan, ctxName),
 		paint(ansiDim, w.apiHost),
-		interval, slowMs, alertMs, minConfirmations, recoveryTicks, notifyState, netCheckState)
+		interval, slowMs, alertMs, minConfirmations, recoveryTicks, notifyState, netCheckState, emailState, stateFileState)
 	fmt.Println(strings.Repeat("─", 80))
 
 	w.initFooter()
@@ -561,6 +618,21 @@ func (w *watcher) recordIncident(now time.Time, severity, apiAlert string,
 		}
 		go sendNotification(title, body, "critical")
 	}
+	if w.email != nil {
+		// Snapshot ticks so the goroutine can't observe later mutations.
+		snap := *w.cur
+		snap.ticks = append([]incidentTick(nil), w.cur.ticks...)
+		subject := fmt.Sprintf("[k8s-cluster-health] %s ALERT", w.cfgContext)
+		body := buildIncidentEmailBody(w.cfgContext, w.apiHost, "open", &snap, "")
+		w.bgWG.Add(1)
+		go func() {
+			defer w.bgWG.Done()
+			if err := w.email.send(subject, body); err != nil {
+				fmt.Fprintf(os.Stderr, "%s email send failed: %v\n",
+					paint(ansiRed, "ERR"), err)
+			}
+		}()
+	}
 }
 
 // closeIncident finalises the active incident, writes the markdown report,
@@ -600,7 +672,22 @@ func (w *watcher) closeIncident(reason string) {
 	w.footer.lastIncidentEnd = inc.endedAt
 	w.footer.lastIncidentDur = dur
 	w.footer.lastIncidentRsn = reason
+	incCount := w.footer.incidentCount
 	w.footer.mu.Unlock()
+
+	if w.stateFile != "" {
+		s := &persistentState{
+			Context:            w.cfgContext,
+			LastIncidentEnd:    inc.endedAt,
+			LastIncidentDur:    dur.String(),
+			LastIncidentReason: reason,
+			IncidentCount:      incCount,
+		}
+		if err := saveState(w.stateFile, s); err != nil {
+			fmt.Fprintf(os.Stderr, "%s state save failed: %v\n",
+				paint(ansiRed, "ERR"), err)
+		}
+	}
 
 	if w.notify {
 		title := fmt.Sprintf("k8s-cluster-health [%s] %s",
@@ -608,12 +695,32 @@ func (w *watcher) closeIncident(reason string) {
 		body := fmt.Sprintf("Incident closed after %s\nReport: %s", dur, path)
 		go sendNotification(title, body, "normal")
 	}
+	if w.email != nil {
+		snap := *inc
+		snap.ticks = append([]incidentTick(nil), inc.ticks...)
+		subject := fmt.Sprintf("[k8s-cluster-health] %s %s",
+			w.cfgContext, strings.ToUpper(reason))
+		body := buildIncidentEmailBody(w.cfgContext, w.apiHost, reason, &snap, path)
+		w.bgWG.Add(1)
+		go func() {
+			defer w.bgWG.Done()
+			if err := w.email.send(subject, body); err != nil {
+				fmt.Fprintf(os.Stderr, "%s email send failed: %v\n",
+					paint(ansiRed, "ERR"), err)
+			}
+		}()
+	}
 }
 
 func (w *watcher) forceCloseIncident() {
 	if w.cur != nil {
 		w.closeIncident("shutdown")
 	}
+	// Block until any in-flight email sends drain so the shutdown email
+	// actually leaves the process. closeIncident kicks off SMTP2GO HTTP
+	// requests in goroutines; without this, the deferred return from main
+	// can race them and the alert never goes out.
+	w.bgWG.Wait()
 }
 
 // initFooter reserves the bottom row of the terminal for a sticky status
@@ -758,14 +865,18 @@ func (w *watcher) renderFooter() {
 }
 
 func (w *watcher) formatFooter() string {
+	// Hold the lock for the whole render rather than copying the struct out
+	// (which `vet` rejects because footerState embeds a sync.Mutex). All
+	// callers — tick(), the per-second refresh, handleResize — run on the
+	// main goroutine via the run-loop select, so there's no contention to
+	// optimise for; the body is microseconds either way.
 	w.footer.mu.Lock()
-	f := w.footer
-	w.footer.mu.Unlock()
+	defer w.footer.mu.Unlock()
 
 	uptime := time.Since(w.startedAt).Round(time.Second)
 
 	var status string
-	switch f.severity {
+	switch w.footer.severity {
 	case "OK":
 		status = paint(ansiGreen+ansiBold, "OK")
 	case "WARN":
@@ -782,33 +893,36 @@ func (w *watcher) formatFooter() string {
 		"ctx=" + paint(ansiCyan, w.cfgContext),
 		"status=" + status,
 	}
-	if f.severity != "" && f.severity != "OFFLINE" {
-		if f.apiCount > 0 {
-			avg := f.apiSumMs / int64(f.apiCount)
+	if w.footer.severity != "" && w.footer.severity != "OFFLINE" {
+		if w.footer.apiCount > 0 {
+			avg := w.footer.apiSumMs / int64(w.footer.apiCount)
 			parts = append(parts, fmt.Sprintf("api avg=%dms min=%dms max=%dms",
-				avg, f.apiMinMs, f.apiMaxMs))
+				avg, w.footer.apiMinMs, w.footer.apiMaxMs))
 		} else {
-			parts = append(parts, fmt.Sprintf("api=%dms", f.apiMs))
+			parts = append(parts, fmt.Sprintf("api=%dms", w.footer.apiMs))
 		}
-		if f.podSummary != "" {
-			parts = append(parts, f.podSummary)
+		if w.footer.podSummary != "" {
+			parts = append(parts, w.footer.podSummary)
 		}
-		if f.nodeSummary != "" {
-			parts = append(parts, "nodes="+f.nodeSummary)
+		if w.footer.nodeSummary != "" {
+			parts = append(parts, "nodes="+w.footer.nodeSummary)
 		}
 	}
 	if w.cur != nil {
 		elapsed := time.Since(w.cur.startedAt).Round(time.Second)
 		parts = append(parts, paint(ansiRed+ansiBold,
 			fmt.Sprintf("INCIDENT %s (%d ticks)", elapsed, len(w.cur.ticks))))
-	} else if !f.lastIncidentEnd.IsZero() {
+	} else if !w.footer.lastIncidentEnd.IsZero() {
+		// Date + time so the user can see at a glance whether the last
+		// incident was today or weeks ago — relevant once the value is
+		// loaded from disk on startup rather than only set in-session.
 		parts = append(parts, fmt.Sprintf("last=%s (%s, %s)",
-			f.lastIncidentEnd.Format("15:04Z"),
-			f.lastIncidentRsn,
-			f.lastIncidentDur))
+			w.footer.lastIncidentEnd.Format("2006-01-02 15:04Z"),
+			w.footer.lastIncidentRsn,
+			w.footer.lastIncidentDur))
 	}
-	parts = append(parts, fmt.Sprintf("warns=%d", f.warnCount))
-	parts = append(parts, fmt.Sprintf("incidents=%d", f.incidentCount))
+	parts = append(parts, fmt.Sprintf("warns=%d", w.footer.warnCount))
+	parts = append(parts, fmt.Sprintf("incidents=%d", w.footer.incidentCount))
 	parts = append(parts, "uptime="+uptime.String())
 
 	return strings.Join(parts, " │ ")
@@ -1124,6 +1238,20 @@ func die(format string, a ...any) {
 	os.Exit(1)
 }
 
+// inContainer is a heuristic: /.dockerenv is reliable for Docker,
+// /run/.containerenv is the Podman equivalent. Used to auto-disable bell
+// and notify-send (both useless without a desktop session) so the same
+// binary is friendly to run as a container entrypoint.
+func inContainer() bool {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	if _, err := os.Stat("/run/.containerenv"); err == nil {
+		return true
+	}
+	return false
+}
+
 func notifyAvailable() bool {
 	if _, err := exec.LookPath("notify-send"); err != nil {
 		return false
@@ -1318,5 +1446,5 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-func sortedBoolKeys(m map[string]bool) []string   { return sortedKeys(m) }
+func sortedBoolKeys(m map[string]bool) []string     { return sortedKeys(m) }
 func sortedStringKeys(m map[string]string) []string { return sortedKeys(m) }
